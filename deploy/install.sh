@@ -33,23 +33,18 @@ detect_platform() {
 fetch_release() {
   local os="$1" arch="$2"
   local base="https://github.com/${REPO}/releases"
-  local url
+  local tag url
   if [[ "${VERSION}" == "latest" ]]; then
-    url="${base}/latest/download/sisumail_${VERSION_PLACEHOLDER}_${os}_${arch}.tar.gz"
-  else
-    url="${base}/download/${VERSION}/sisumail_${VERSION}_${os}_${arch}.tar.gz"
-  fi
-
-  # For latest, we need to resolve tag name first.
-  local tag="${VERSION}"
-  if [[ "${VERSION}" == "latest" ]]; then
+    # Resolve the latest tag name via redirect.
     tag="$(curl -fsSLI "${base}/latest" | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r' | sed -n 's#.*/tag/##p')"
     if [[ -z "${tag}" ]]; then
       echo "error: failed to resolve latest tag" >&2
       exit 1
     fi
-    url="${base}/download/${tag}/sisumail_${tag}_${os}_${arch}.tar.gz"
+  else
+    tag="${VERSION}"
   fi
+  url="${base}/download/${tag}/sisumail_${tag}_${os}_${arch}.tar.gz"
 
   mkdir -p /tmp/sisumail-install
   curl -fsSLo "/tmp/sisumail-install/sisumail.tar.gz" "${url}"
@@ -126,4 +121,3 @@ main() {
 }
 
 main "$@"
-
