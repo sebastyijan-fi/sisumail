@@ -11,11 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/emersion/go-smtp"
 	"github.com/sisumail/sisumail/internal/proto"
+	"github.com/sisumail/sisumail/internal/tier2"
 	"github.com/sisumail/sisumail/internal/tlsboot"
 	"golang.org/x/crypto/ssh"
 )
@@ -117,6 +119,14 @@ func main() {
 		}
 	}()
 
+	// Accept Tier 2 spool deliveries from relay.
+	go func() {
+		chans := client.HandleChannelOpen("spool-delivery")
+		for ch := range chans {
+			go handleSpoolChannel(ch, string(sshKey))
+		}
+	}()
+
 	<-ctx.Done()
 	_ = srv.Close()
 }
@@ -152,6 +162,40 @@ func handleChannel(ch ssh.NewChannel, smtpListen string) {
 	go func() { _, _ = io.Copy(local, channel); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(channel, local); done <- struct{}{} }()
 	<-done
+}
+
+func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string) {
+	if ch.ChannelType() != "spool-delivery" {
+		_ = ch.Reject(ssh.UnknownChannelType, "unsupported channel")
+		return
+	}
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer channel.Close()
+
+	h, br, err := proto.ReadSpoolDeliveryHeader(channel)
+	if err != nil {
+		return
+	}
+
+	// Decrypt ciphertext stream (bounded) and log a small prefix for now.
+	// Later: store into Maildir and show in TUI.
+	lr := io.LimitReader(br, h.SizeBytes)
+	var buf strings.Builder
+	if err := tier2.StreamDecrypt(&buf, lr, sshPrivKey); err != nil {
+		log.Printf("spool-delivery: decrypt failed msg=%s err=%v", h.MessageID, err)
+		return
+	}
+	plain := buf.String()
+	if len(plain) > 200 {
+		plain = plain[:200]
+	}
+	log.Printf("spool-delivery: msg=%s plaintext_prefix=%q", h.MessageID, plain)
+
+	_ = proto.WriteSpoolAck(channel, h.MessageID)
 }
 
 type localBackend struct{}

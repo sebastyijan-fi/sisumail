@@ -24,6 +24,12 @@ func Open(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Improve concurrency characteristics:
+	// - WAL allows concurrent readers while a writer is active.
+	// - busy_timeout makes concurrent writes wait briefly instead of failing fast.
+	// If these pragmas fail, continue; the DB will still work, just more lock-prone.
+	_, _ = db.Exec(`PRAGMA journal_mode = WAL;`)
+	_, _ = db.Exec(`PRAGMA busy_timeout = 5000;`) // milliseconds
 	// Keep this conservative; the relay should not hold long SQLite locks.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)

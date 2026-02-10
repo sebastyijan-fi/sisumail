@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -22,7 +23,9 @@ import (
 	"github.com/sisumail/sisumail/internal/dns/hetznercloud"
 	"github.com/sisumail/sisumail/internal/identity"
 	"github.com/sisumail/sisumail/internal/provision"
+	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/relay"
+	"github.com/sisumail/sisumail/internal/tier2"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -39,6 +42,7 @@ func main() {
 		pubkeyPath  = flag.String("pubkey", "", "path to SSH public key file for -add-user")
 		ipv6Str     = flag.String("ipv6", "", "IPv6 address for -add-user")
 		allowClaim  = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
+		spoolDir    = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
 	)
 	flag.Parse()
 
@@ -146,8 +150,10 @@ func main() {
 	}
 	serverCfg.AddHostKey(hostKey)
 
+	spool := &tier2.FileSpool{Root: *spoolDir}
+
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, reg); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, reg, spool); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -213,7 +219,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg *relay.SessionRegistry) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -237,11 +243,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg 
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, reg)
+		go handleSSHConn(ctx, nc, cfg, reg, spool)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg *relay.SessionRegistry) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -261,6 +267,12 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 		reg.DeleteSession(user)
 		log.Printf("ssh session deregistered: user=%s", user)
 	}()
+
+	// Deliver any pending Tier 2 spool entries for this user (best-effort).
+	// This keeps the "spool on reconnect" promise without requiring polling.
+	if spool != nil {
+		go deliverPendingSpool(ctx, sshConn, user, spool)
+	}
 
 	// Ignore global requests.
 	go ssh.DiscardRequests(reqs)
@@ -290,6 +302,61 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 				_ = c.Close()
 			}(newCh)
 		}
+	}
+}
+
+func deliverPendingSpool(ctx context.Context, sshConn *ssh.ServerConn, user string, spool *tier2.FileSpool) {
+	list, err := spool.List(user)
+	if err != nil || len(list) == 0 {
+		return
+	}
+	// Small delay to let the client set up channel handlers.
+	time.Sleep(150 * time.Millisecond)
+
+	for _, meta := range list {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		rc, gotMeta, err := spool.Get(user, meta.MessageID)
+		if err != nil {
+			continue
+		}
+
+		ch, reqs, err := sshConn.OpenChannel("spool-delivery", nil)
+		if err != nil {
+			_ = rc.Close()
+			continue
+		}
+		go ssh.DiscardRequests(reqs)
+
+		h := proto.SpoolDeliveryHeader{MessageID: meta.MessageID, SizeBytes: gotMeta.SizeBytes}
+		if err := proto.WriteSpoolDeliveryHeader(ch, h); err != nil {
+			_ = rc.Close()
+			_ = ch.Close()
+			continue
+		}
+
+		_, copyErr := io.Copy(ch, rc)
+		_ = rc.Close()
+		if copyErr != nil {
+			_ = ch.Close()
+			continue
+		}
+
+		// Wait for ACK, then delete from spool.
+		ackCh := make(chan error, 1)
+		go func() { ackCh <- proto.ReadSpoolAck(ch, meta.MessageID) }()
+		select {
+		case err := <-ackCh:
+			if err == nil {
+				_ = spool.Ack(user, meta.MessageID)
+			}
+		case <-time.After(3 * time.Second):
+			// Best-effort; client may be offline/slow. Keep the spool entry.
+		}
+		_ = ch.Close()
 	}
 }
 
