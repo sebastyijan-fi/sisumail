@@ -1,17 +1,19 @@
 $ORIGIN sisumail.fi.
 $TTL 300
 
-; ---- SOA / NS (Hetzner DNS typically uses these) ----
-@   IN SOA  ns1.hetzner.com. hostmaster.sisumail.fi. (
-        2026021003 ; serial (YYYYMMDDNN)
+; ---- SOA / NS (example) ----
+; NOTE: When using Hetzner Console DNS, you typically do not hand-edit SOA/NS.
+; This zone file is provided only as a reference/template for operators that
+; want to import initial records elsewhere.
+@   IN SOA  ns1.example. hostmaster.sisumail.fi. (
+        2026021000 ; serial (YYYYMMDDNN)
         3600       ; refresh
         900        ; retry
         1209600    ; expire
         300        ; minimum
 )
-    IN NS   ns1.hetzner.com.
-    IN NS   ns2.hetzner.com.
-    IN NS   ns3.hetzner.com.
+    IN NS   ns1.example.
+    IN NS   ns2.example.
 
 ; ---- Base hosts ----
 ; Replace these with your relay's public IPs.
@@ -31,3 +33,4 @@ spool           IN AAAA  <relay-ipv6>
 ; <u>            IN MX 20 spool.sisumail.fi.
 ; <u>            IN TXT   "v=spf1 -all"
 ; <u>            IN CAA   0 issue "letsencrypt.org"
+

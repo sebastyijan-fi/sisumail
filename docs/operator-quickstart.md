@@ -60,11 +60,21 @@ apt-get update
 apt-get install -y git ca-certificates curl
 ```
 
-Install Go (version must satisfy `go.mod`). This repo currently targets Go `1.24.x`.
+If you build from source, install Go (version must satisfy `go.mod`). This repo currently targets Go `1.24.x`.
 
-## 4) Clone + Build
+## 4) Install (Recommended: Release Binaries)
 
-Public repo (recommended for operators):
+This is the intended v1 operator experience: no Go toolchain required.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<org-or-user>/sisumail/main/deploy/install.sh | sudo bash
+```
+
+Then edit `/etc/sisumail.env` and restart the relay.
+
+## 5) Install (Alternative: Build From Source)
+
+Public repo:
 
 ```bash
 git clone https://github.com/<org-or-user>/sisumail.git
@@ -73,16 +83,14 @@ go test ./...
 go build -o /usr/local/bin/sisumail-relay ./cmd/sisumail-relay
 ```
 
-Private repo: use a read-only deploy key (see `README.md` notes).
-
-## 5) Create Relay State Directories
+## 6) Create Relay State Directories
 
 ```bash
 mkdir -p /var/lib/sisumail /var/spool/sisumail
 chmod 700 /var/lib/sisumail
 ```
 
-## 6) Configure Secrets (Hetzner DNS Token)
+## 7) Configure Secrets (Hetzner DNS Token)
 
 Create `/etc/sisumail.env` with mode `0600`:
 
@@ -104,7 +112,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" \
   "https://api.hetzner.cloud/v1/zones?name=${SISUMAIL_DNS_ZONE}"
 ```
 
-## 7) Run via systemd (Dev Ports)
+## 8) Run via systemd (Dev Ports)
 
 Start on dev ports to avoid lockout and avoid binding real port 25 prematurely:
 
@@ -149,7 +157,7 @@ systemctl enable --now sisumail-relay
 systemctl status sisumail-relay --no-pager
 ```
 
-## 8) Verify Claim + DNS Provisioning
+## 9) Verify Claim + DNS Provisioning
 
 Once nameservers have propagated and the token is valid:
 
@@ -162,7 +170,7 @@ Inspect relay logs:
 journalctl -u sisumail-relay -n 200 --no-pager
 ```
 
-## 9) Production Cutover (Later)
+## 10) Production Cutover (Later)
 
 Do not do this until Tier 2 + hardening are ready.
 

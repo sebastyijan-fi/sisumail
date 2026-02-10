@@ -1,0 +1,64 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          OUTDIR="dist/${VERSION}/${GOOS}-${GOARCH}"
+          mkdir -p "${OUTDIR}"
+
+          go test ./...
+
+          go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail-relay" ./cmd/sisumail-relay
+          go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail" ./cmd/sisumail
+
+          # Package as tar.gz (zip on Windows is not needed yet).
+          tar -C "${OUTDIR}" -czf "dist/sisumail_${VERSION}_${GOOS}_${GOARCH}.tar.gz" sisumail-relay sisumail
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > sha256sum.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/sha256sum.txt
+

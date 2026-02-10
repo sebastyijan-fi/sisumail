@@ -1,0 +1,25 @@
+[Unit]
+Description=Sisumail Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sisumail.env
+ExecStart=/usr/local/bin/sisumail-relay \
+  -ssh-listen :2222 \
+  -tier1-listen :2525 \
+  -db /var/lib/sisumail/relay.db \
+  -hostkey /var/lib/sisumail/hostkey_ed25519
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail /var/spool/sisumail
+
+[Install]
+WantedBy=multi-user.target
+
