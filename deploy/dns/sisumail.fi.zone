@@ -3,7 +3,7 @@ $TTL 300
 
 ; ---- SOA / NS (Hetzner DNS typically uses these) ----
 @   IN SOA  ns1.hetzner.com. hostmaster.sisumail.fi. (
-        2026021001 ; serial (YYYYMMDDNN)
+        2026021003 ; serial (YYYYMMDDNN)
         3600       ; refresh
         900        ; retry
         1209600    ; expire
@@ -14,16 +14,20 @@ $TTL 300
     IN NS   ns3.hetzner.com.
 
 ; ---- Base hosts ----
-@               IN A     37.27.19.170
-@               IN AAAA  2a01:4f9:c013:b8b6::1
+; Replace these with your relay's public IPs.
+@               IN A     <relay-ipv4>
+@               IN AAAA  <relay-ipv6>
 
-spool           IN A     37.27.19.170
-spool           IN AAAA  2a01:4f9:c013:b8b6::1
+; Tier 2 fallback MX host (recommended dual-stack).
+spool           IN A     <relay-ipv4>
+spool           IN AAAA  <relay-ipv6>
 
-; ---- Per-user Tier 1 target (test user: niklas) ----
-v6.niklas       IN AAAA  2a01:4f9:c013:b8b6::1234
-
-; ---- Split MX for user domain (niklas.sisumail.fi) ----
-niklas          IN MX 10 v6.niklas.sisumail.fi.
-niklas          IN MX 20 spool.sisumail.fi.
-
+; ---- Per-user records (created dynamically by the relay) ----
+; Sisumail does NOT use wildcards and does NOT pre-seed users in DNS.
+; When a user claims <u>, the relay provisions:
+;
+; v6.<u>         IN AAAA  <allocated-from-your-/64>
+; <u>            IN MX 10 v6.<u>.sisumail.fi.
+; <u>            IN MX 20 spool.sisumail.fi.
+; <u>            IN TXT   "v=spf1 -all"
+; <u>            IN CAA   0 issue "letsencrypt.org"

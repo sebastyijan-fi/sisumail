@@ -30,7 +30,7 @@ func main() {
 	var (
 		sshListen   = flag.String("ssh-listen", ":2222", "SSH gateway listen address (dev default :2222)")
 		tier1Listen = flag.String("tier1-listen", ":2525", "Tier 1 TCP proxy listen address (dev default :2525)")
-		devUser     = flag.String("dev-user", "niklas", "dev-only: route all Tier 1 traffic to this username (empty disables)")
+		devUser     = flag.String("dev-user", "", "dev-only: route all Tier 1 traffic to this username (empty disables)")
 		hostKeyPath = flag.String("hostkey", "./data/relay_hostkey_ed25519", "path to relay SSH host key (created if missing)")
 		dbPath      = flag.String("db", "./data/relay.db", "identity registry sqlite path")
 		initDB      = flag.Bool("init-db", false, "initialize database schema and exit")
