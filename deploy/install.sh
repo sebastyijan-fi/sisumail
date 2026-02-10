@@ -45,14 +45,15 @@ fetch_release() {
     tag="${VERSION}"
   fi
   url="${base}/download/${tag}/sisumail_${tag}_${os}_${arch}.tar.gz"
+  local fname="sisumail_${tag}_${os}_${arch}.tar.gz"
 
   mkdir -p /tmp/sisumail-install
-  curl -fsSLo "/tmp/sisumail-install/sisumail.tar.gz" "${url}"
+  curl -fsSLo "/tmp/sisumail-install/${fname}" "${url}"
   curl -fsSLo "/tmp/sisumail-install/sha256sum.txt" "${base}/download/${tag}/sha256sum.txt"
 
-  (cd /tmp/sisumail-install && sha256sum -c sha256sum.txt --ignore-missing)
+  (cd /tmp/sisumail-install && sha256sum -c sha256sum.txt --ignore-missing | grep -q "${fname}: OK")
 
-  tar -C /tmp/sisumail-install -xzf /tmp/sisumail-install/sisumail.tar.gz
+  tar -C /tmp/sisumail-install -xzf "/tmp/sisumail-install/${fname}"
 
   install -d -m 0755 "${BIN_DIR}"
   install -m 0755 /tmp/sisumail-install/sisumail-relay "${BIN_DIR}/sisumail-relay"

@@ -18,17 +18,17 @@ if [[ -z "${tag}" ]]; then
   echo "failed to resolve latest tag" >&2
   exit 1
 fi
+fname="sisumail_${tag}_${os}_${arch}.tar.gz"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 
-curl -fsSLo "${tmp}/sisumail.tar.gz" "${base}/download/${tag}/sisumail_${tag}_${os}_${arch}.tar.gz"
+curl -fsSLo "${tmp}/${fname}" "${base}/download/${tag}/${fname}"
 curl -fsSLo "${tmp}/sha256sum.txt" "${base}/download/${tag}/sha256sum.txt"
-(cd "${tmp}" && sha256sum -c sha256sum.txt --ignore-missing)
+(cd "${tmp}" && sha256sum -c sha256sum.txt --ignore-missing | grep -q "${fname}: OK")
 
-tar -C "${tmp}" -xzf "${tmp}/sisumail.tar.gz"
+tar -C "${tmp}" -xzf "${tmp}/${fname}"
 install -m 0755 "${tmp}/sisumail-relay" "${BIN_DIR}/sisumail-relay"
 install -m 0755 "${tmp}/sisumail" "${BIN_DIR}/sisumail"
 
 systemctl restart sisumail-relay
-
