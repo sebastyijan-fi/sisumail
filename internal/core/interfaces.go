@@ -36,29 +36,23 @@ type IdentityStore interface {
 // DNS (§7 — Split MX Architecture)
 // ---------------------------------------------------------------------------
 
-// DNSRecord represents a single DNS record to be created or deleted.
-type DNSRecord struct {
-	Type  string // MX, AAAA, TXT, CAA
-	Name  string // FQDN, e.g. "niklas.sisumail.fi"
-	Value string // record value
-	TTL   int    // seconds, 0 = provider default
+// DNSRRSet represents a single RRSet (records of the same name+type).
+//
+// Hetzner Console DNS is RRSet-based (name+type share TTL, and values are a list).
+// This also matches how provisioning works for split MX (two MX values at once).
+type DNSRRSet struct {
+	Type   string   // MX, AAAA, TXT, CAA
+	Name   string   // FQDN or relative label; provider may normalize
+	TTL    int      // seconds, 0 = provider default
+	Values []string // RR values (e.g. MX: "10 v6.user.zone.", "20 spool.zone.")
 }
 
-// DNSProvider manages DNS records via a hosting API.
+// DNSProvider manages DNS records via a hosting API (RRSet-based).
 type DNSProvider interface {
-	CreateRecord(zoneID string, rec DNSRecord) (recordID string, err error)
-	DeleteRecord(zoneID, recordID string) error
-	ListRecords(zoneID, name string) ([]DNSRecordEntry, error)
+	UpsertRRSet(zoneID string, rrset DNSRRSet) error
+	DeleteRRSet(zoneID string, name string, typ string) error
+	GetRRSet(zoneID string, name string, typ string) (*DNSRRSet, error)
 	GetZoneIDByName(zoneName string) (string, error)
-}
-
-// DNSRecordEntry is a record returned from the provider, including its ID.
-type DNSRecordEntry struct {
-	ID    string
-	Type  string
-	Name  string
-	Value string
-	TTL   int
 }
 
 // DNSProvisioner is the high-level interface for user DNS lifecycle.
@@ -80,10 +74,10 @@ type KeyResolver interface {
 // SpoolMeta is the metadata stored alongside ciphertext in the spool.
 type SpoolMeta struct {
 	MessageID  string    `json:"message_id"`
-	Recipient  string    `json:"recipient"`   // "<user>.sisumail.fi"
+	Recipient  string    `json:"recipient"` // "<user>.sisumail.fi"
 	ReceivedAt time.Time `json:"received_at"`
-	SizeBytes  int64     `json:"size_bytes"`  // ciphertext size
-	Tier       string    `json:"tier"`        // always "tier2"
+	SizeBytes  int64     `json:"size_bytes"` // ciphertext size
+	Tier       string    `json:"tier"`       // always "tier2"
 }
 
 // SpoolStore writes and reads encrypted Tier 2 spool entries.
@@ -120,13 +114,13 @@ type MaildirStore interface {
 
 // AliasStats tracks per-tag usage statistics.
 type AliasStats struct {
-	Tag              string
-	UseCount         int
-	FirstSeen        time.Time
-	LastSeen         time.Time
-	UniqueSenders    int
-	SenderDomains    []string
-	ProbableLeak     bool
+	Tag           string
+	UseCount      int
+	FirstSeen     time.Time
+	LastSeen      time.Time
+	UniqueSenders int
+	SenderDomains []string
+	ProbableLeak  bool
 }
 
 // AliasTracker manages alias tag tracking and leak detection.

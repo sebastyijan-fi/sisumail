@@ -32,4 +32,4 @@ For user `<u>` with allocated IPv6 `<ipv6>`:
 
 - **Create**: `internal/provision/provision.go` → `ProvisionUser(username, destIPv6)`
 - **Delete**: `internal/provision/provision.go` → `DeprovisionUser(username)`
-- **Backend**: `internal/dns/hetzner/client.go` → Hetzner DNS API
+- **Backend**: `internal/dns/hetznercloud/client.go` → Hetzner Console (Cloud API) Zones API

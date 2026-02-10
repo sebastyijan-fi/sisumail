@@ -36,37 +36,26 @@ func (p *Provisioner) ProvisionUser(username string, destIPv6 net.IP) error {
 	userDomain := fmt.Sprintf("%s.%s", username, p.ZoneName)
 	tier1Host := fmt.Sprintf("v6.%s.%s", username, p.ZoneName)
 
-	records := []core.DNSRecord{
-		{Type: "MX", Name: userDomain, Value: fmt.Sprintf("10 %s.", tier1Host), TTL: 300},
-		{Type: "MX", Name: userDomain, Value: fmt.Sprintf("20 spool.%s.", p.ZoneName), TTL: 300},
-		{Type: "AAAA", Name: tier1Host, Value: destIPv6.String(), TTL: 300},
-		{Type: "TXT", Name: userDomain, Value: "v=spf1 -all", TTL: 3600},
-		{Type: "CAA", Name: userDomain, Value: `0 issue "letsencrypt.org"`, TTL: 3600},
+	rrsets := []core.DNSRRSet{
+		{
+			Type:   "MX",
+			Name:   userDomain,
+			TTL:    300,
+			Values: []string{fmt.Sprintf("10 %s.", tier1Host), fmt.Sprintf("20 spool.%s.", p.ZoneName)},
+		},
+		{Type: "AAAA", Name: tier1Host, TTL: 300, Values: []string{destIPv6.String()}},
+		{Type: "TXT", Name: userDomain, TTL: 3600, Values: []string{"v=spf1 -all"}},
+		{Type: "CAA", Name: userDomain, TTL: 3600, Values: []string{`0 issue "letsencrypt.org"`}},
 	}
 
-	for _, rec := range records {
-		if err := p.ensureRecord(zoneID, rec); err != nil {
+	for _, rr := range rrsets {
+		if err := p.DNS.UpsertRRSet(zoneID, rr); err != nil {
 			// Best effort: try to clean up already-created records on failure.
 			_ = p.DeprovisionUser(username)
-			return fmt.Errorf("provision %s: ensure %s %s: %w", username, rec.Type, rec.Name, err)
+			return fmt.Errorf("provision %s: upsert %s %s: %w", username, rr.Type, rr.Name, err)
 		}
 	}
 	return nil
-}
-
-func (p *Provisioner) ensureRecord(zoneID string, rec core.DNSRecord) error {
-	// Idempotency: if record already exists with the same name/type/value, do nothing.
-	existing, err := p.DNS.ListRecords(zoneID, rec.Name)
-	if err != nil {
-		return err
-	}
-	for _, e := range existing {
-		if e.Name == rec.Name && e.Type == rec.Type && e.Value == rec.Value {
-			return nil
-		}
-	}
-	_, err = p.DNS.CreateRecord(zoneID, rec)
-	return err
 }
 
 // DeprovisionUser removes all DNS records for a user.
@@ -79,16 +68,18 @@ func (p *Provisioner) DeprovisionUser(username string) error {
 	userDomain := fmt.Sprintf("%s.%s", username, p.ZoneName)
 	tier1Host := fmt.Sprintf("v6.%s.%s", username, p.ZoneName)
 
-	// Delete records matching both the user domain and the Tier 1 hostname.
-	for _, name := range []string{userDomain, tier1Host} {
-		records, err := p.DNS.ListRecords(zoneID, name)
-		if err != nil {
-			return fmt.Errorf("deprovision %s: list %s: %w", username, name, err)
-		}
-		for _, rec := range records {
-			if err := p.DNS.DeleteRecord(zoneID, rec.ID); err != nil {
-				return fmt.Errorf("deprovision %s: delete %s (%s): %w", username, rec.ID, rec.Type, err)
-			}
+	// Delete RRSets we manage for this user.
+	for _, rr := range []struct {
+		name string
+		typ  string
+	}{
+		{name: userDomain, typ: "MX"},
+		{name: tier1Host, typ: "AAAA"},
+		{name: userDomain, typ: "TXT"},
+		{name: userDomain, typ: "CAA"},
+	} {
+		if err := p.DNS.DeleteRRSet(zoneID, rr.name, rr.typ); err != nil {
+			return fmt.Errorf("deprovision %s: delete rrset %s %s: %w", username, rr.typ, rr.name, err)
 		}
 	}
 	return nil

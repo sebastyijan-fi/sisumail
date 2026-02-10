@@ -8,7 +8,7 @@ Working today (local harness + current relay):
 - Tier 1 blind TCP proxy that pipes an inbound TCP connection into an SSH channel (`smtp-delivery`).
 - Out-of-band sender metadata preface on the SSH channel (not injected into the SMTP stream).
 - Client-side local SMTP daemon that requires STARTTLS before accepting MAIL/RCPT/DATA (confidentiality-first).
-- Split-MX DNS record set implementation exists (`internal/provision` + `internal/dns/hetzner`).
+- Split-MX DNS record set implementation exists (`internal/provision` + `internal/dns/hetznercloud`).
 - Identity registry (SQLite) with first-come claim semantics and per-user IPv6 allocation from a /64.
 
 Not working yet / not complete (do not assume production-ready):

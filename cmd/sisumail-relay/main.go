@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sisumail/sisumail/internal/dns/hetzner"
+	"github.com/sisumail/sisumail/internal/dns/hetznercloud"
 	"github.com/sisumail/sisumail/internal/identity"
 	"github.com/sisumail/sisumail/internal/provision"
 	"github.com/sisumail/sisumail/internal/relay"
@@ -173,7 +173,12 @@ func main() {
 }
 
 func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
-	token := strings.TrimSpace(os.Getenv("HETZNER_DNS_TOKEN"))
+	// Hetzner Console (Cloud API) token. This is NOT the deprecated dns.hetzner.com token.
+	// Accept both names for operator convenience.
+	token := strings.TrimSpace(os.Getenv("HCLOUD_TOKEN"))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("HETZNER_CLOUD_TOKEN"))
+	}
 	zone := strings.TrimSpace(os.Getenv("SISUMAIL_DNS_ZONE"))
 	prefixStr := strings.TrimSpace(os.Getenv("SISUMAIL_IPV6_PREFIX"))
 	if token == "" || zone == "" || prefixStr == "" {
@@ -184,7 +189,7 @@ func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
 		log.Printf("invalid SISUMAIL_IPV6_PREFIX: %v", err)
 		return nil, nil
 	}
-	dns := hetzner.NewClient(token)
+	dns := hetznercloud.NewClient(token, zone)
 	return &provision.Provisioner{DNS: dns, ZoneName: zone}, ipnet
 }
 

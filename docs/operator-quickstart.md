@@ -88,7 +88,7 @@ Create `/etc/sisumail.env` with mode `0600`:
 
 ```bash
 cat > /etc/sisumail.env <<EOF
-HETZNER_DNS_TOKEN=...                   # from dns.hetzner.com
+HCLOUD_TOKEN=...                        # Hetzner Console/Cloud API token (Security -> API token)
 SISUMAIL_DNS_ZONE=<zone>               # e.g. sisumail.fi
 SISUMAIL_IPV6_PREFIX=<relay_ipv6>/64   # your routed /64
 EOF
@@ -100,8 +100,8 @@ Quick validity check (must return `200`):
 ```bash
 . /etc/sisumail.env
 curl -sS -o /dev/null -w "%{http_code}\n" \
-  -H "Auth-API-Token: ${HETZNER_DNS_TOKEN}" \
-  "https://dns.hetzner.com/api/v1/zones?name=${SISUMAIL_DNS_ZONE}"
+  -H "Authorization: Bearer ${HCLOUD_TOKEN}" \
+  "https://api.hetzner.cloud/v1/zones?name=${SISUMAIL_DNS_ZONE}"
 ```
 
 ## 7) Run via systemd (Dev Ports)
@@ -174,4 +174,3 @@ Do not do this until Tier 2 + hardening are ready.
 
 - Never commit DNS tokens, host keys, or ACME keys/certs to git.
 - Treat Tier 2 as an email-processing component (plaintext exists transiently during ingest).
-
