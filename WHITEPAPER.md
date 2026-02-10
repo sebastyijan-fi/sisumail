@@ -265,6 +265,17 @@ Tier 2 adds:
 - **IPv6 quirks:** some senders will still choose Tier 2 even when Tier 1 exists.
 - **Receive-only implications:** by default, SPF can be `-all`. Users should expect that sending mail as a Sisumail address from third-party SMTP will fail SPF/DMARC alignment.
 
+## 15.1 Scaling Note: DNS Record Volume
+Sisumail's Tier 1 delivery model requires per-user DNS records (at minimum: `MX <u>.<zone>` and `AAAA v6.<u>.<zone>`). This implies that very large deployments create a very large number of DNS objects.
+
+Practical implication:
+- v1 can run comfortably on a managed DNS provider for small to medium scale (hundreds to thousands of users), but "millions of users under one zone on a managed DNS provider" is not a realistic assumption without enterprise arrangements.
+
+Scaling paths (do not change Tier 1 security properties):
+- **Sharding across zones/domains:** spread users across multiple zones (multiple domains).
+- **Delegated subzones:** delegate `a.<zone>`, `b.<zone>`, ... via NS to distribute DNS record volume across operators/backends.
+- **Self-host authoritative DNS:** run Knot/PowerDNS/NSD for large-scale record volumes and tighter operational control.
+
 ## 16. Threat Model Summary
 
 ### Tier 1
