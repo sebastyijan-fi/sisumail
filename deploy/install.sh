@@ -61,13 +61,104 @@ fetch_release() {
 }
 
 install_systemd_units() {
-  install -d -m 0755 /etc/systemd/system
-  install -m 0644 "$(dirname "$0")/systemd/sisumail-relay.service" /etc/systemd/system/sisumail-relay.service
-  install -m 0644 "$(dirname "$0")/systemd/sisumail-update.service" /etc/systemd/system/sisumail-update.service
-  install -m 0644 "$(dirname "$0")/systemd/sisumail-update.timer" /etc/systemd/system/sisumail-update.timer
+  # NOTE: this script is often executed via curl | bash, so it cannot rely on
+  # relative paths next to "$0". Keep installer self-contained.
 
+  install -d -m 0755 /etc/systemd/system
   install -d -m 0755 "${LIB_DIR}"
-  install -m 0755 "$(dirname "$0")/vps/update.sh" "${LIB_DIR}/update.sh"
+
+  cat > /etc/systemd/system/sisumail-relay.service <<'EOF'
+[Unit]
+Description=Sisumail Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sisumail.env
+ExecStart=/usr/local/bin/sisumail-relay \
+  -ssh-listen :2222 \
+  -tier1-listen :2525 \
+  -db /var/lib/sisumail/relay.db \
+  -hostkey /var/lib/sisumail/hostkey_ed25519
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail /var/spool/sisumail
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/sisumail-update.service <<'EOF'
+[Unit]
+Description=Sisumail Update (pull latest release and restart services)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/sisumail/update.sh
+EOF
+
+  cat > /etc/systemd/system/sisumail-update.timer <<'EOF'
+[Unit]
+Description=Sisumail Update Timer (daily)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "${LIB_DIR}/update.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${SISUMAIL_REPO:-sebastyijan-fi/sisumail}"
+BIN_DIR="${SISUMAIL_BIN_DIR:-/usr/local/bin}"
+
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "${arch}" in
+  x86_64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "unsupported arch: ${arch}" >&2; exit 1 ;;
+esac
+
+base="https://github.com/${REPO}/releases"
+tag="$(curl -fsSLI "${base}/latest" | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r' | sed -n 's#.*/tag/##p')"
+if [[ -z "${tag}" ]]; then
+  echo "failed to resolve latest tag" >&2
+  exit 1
+fi
+fname="sisumail_${tag}_${os}_${arch}.tar.gz"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+
+curl -fsSLo "${tmp}/${fname}" "${base}/download/${tag}/${fname}"
+curl -fsSLo "${tmp}/sha256sum.txt" "${base}/download/${tag}/sha256sum.txt"
+(cd "${tmp}" && sha256sum -c sha256sum.txt --ignore-missing | grep -q "${fname}: OK")
+
+tar -C "${tmp}" -xzf "${tmp}/${fname}"
+install -m 0755 "${tmp}/sisumail-relay" "${BIN_DIR}/sisumail-relay"
+install -m 0755 "${tmp}/sisumail" "${BIN_DIR}/sisumail"
+
+systemctl restart sisumail-relay
+EOF
+
+  chmod 0644 /etc/systemd/system/sisumail-relay.service
+  chmod 0644 /etc/systemd/system/sisumail-update.service
+  chmod 0644 /etc/systemd/system/sisumail-update.timer
+  chmod 0755 "${LIB_DIR}/update.sh"
 
   systemctl daemon-reload
 }
