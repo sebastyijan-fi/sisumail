@@ -42,12 +42,34 @@ func NewClient(apiToken, zoneName string) *Client {
 }
 
 type apiZone struct {
-	ID   string `json:"id"`
+	ID   zoneID `json:"id"`
 	Name string `json:"name"`
 }
 
 type listZonesResponse struct {
 	Zones []apiZone `json:"zones"`
+}
+
+// zoneID accepts either a JSON string or a JSON number and canonicalizes to string.
+// Hetzner Console DNS zones have been observed to return numeric IDs.
+type zoneID string
+
+func (z *zoneID) UnmarshalJSON(b []byte) error {
+	// Try string first.
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*z = zoneID(s)
+		return nil
+	}
+	// Then number.
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&n); err == nil {
+		*z = zoneID(n.String())
+		return nil
+	}
+	return fmt.Errorf("invalid zone id: %s", string(b))
 }
 
 type apiRRSetRecord struct {
@@ -94,7 +116,7 @@ func (c *Client) GetZoneIDByName(zoneName string) (string, error) {
 	}
 	for _, z := range resp.Zones {
 		if strings.TrimSuffix(z.Name, ".") == strings.TrimSuffix(zoneName, ".") {
-			return z.ID, nil
+			return string(z.ID), nil
 		}
 	}
 	return "", fmt.Errorf("zone %q not found", zoneName)
