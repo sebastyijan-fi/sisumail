@@ -81,10 +81,16 @@ func (m *mockCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"message":"bad request"}}`, http.StatusBadRequest)
 			return
 		}
-		k := m.key(zid, req.RRSet.Name, req.RRSet.Type)
-		m.rrsets[k] = req.RRSet
+		rr := apiRRSet{
+			Name:    req.Name,
+			Type:    req.Type,
+			TTL:     req.TTL,
+			Records: req.Records,
+		}
+		k := m.key(zid, rr.Name, rr.Type)
+		m.rrsets[k] = rr
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"rrset": req.RRSet})
+		_ = json.NewEncoder(w).Encode(map[string]any{"rrset": rr})
 		return
 
 	case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/actions/set_records"):

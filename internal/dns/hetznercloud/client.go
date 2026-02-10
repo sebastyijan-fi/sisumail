@@ -89,7 +89,10 @@ type listRRSetsResponse struct {
 }
 
 type createRRSetRequest struct {
-	RRSet apiRRSet `json:"rrset"`
+	Name    string           `json:"name"`
+	Type    string           `json:"type"`
+	TTL     int              `json:"ttl,omitempty"`
+	Records []apiRRSetRecord `json:"records"`
 }
 
 type rrsetActionRequest struct {
@@ -145,12 +148,10 @@ func (c *Client) UpsertRRSet(zoneID string, rrset core.DNSRRSet) error {
 		recs = append(recs, apiRRSetRecord{Value: v})
 	}
 	payload, _ := json.Marshal(createRRSetRequest{
-		RRSet: apiRRSet{
-			Name:    name,
-			Type:    typ,
-			TTL:     rrset.TTL,
-			Records: recs,
-		},
+		Name:    name,
+		Type:    typ,
+		TTL:     rrset.TTL,
+		Records: recs,
 	})
 	req, err := c.newRequest(http.MethodPost, fmt.Sprintf("/zones/%s/rrsets", zoneID), bytes.NewReader(payload))
 	if err != nil {
