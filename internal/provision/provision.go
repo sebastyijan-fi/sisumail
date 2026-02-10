@@ -44,7 +44,8 @@ func (p *Provisioner) ProvisionUser(username string, destIPv6 net.IP) error {
 			Values: []string{fmt.Sprintf("10 %s.", tier1Host), fmt.Sprintf("20 spool.%s.", p.ZoneName)},
 		},
 		{Type: "AAAA", Name: tier1Host, TTL: 300, Values: []string{destIPv6.String()}},
-		{Type: "TXT", Name: userDomain, TTL: 3600, Values: []string{"v=spf1 -all"}},
+		// Hetzner Console DNS requires TXT record values to include the surrounding quotes.
+		{Type: "TXT", Name: userDomain, TTL: 3600, Values: []string{`"v=spf1 -all"`}},
 		{Type: "CAA", Name: userDomain, TTL: 3600, Values: []string{`0 issue "letsencrypt.org"`}},
 	}
 

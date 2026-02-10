@@ -118,7 +118,7 @@ func TestProvisionCreatesExpectedRRSets(t *testing.T) {
 	}
 
 	txt := get("niklas.sisumail.fi", "TXT")
-	if txt == nil || len(txt.Values) != 1 || txt.Values[0] != "v=spf1 -all" {
+	if txt == nil || len(txt.Values) != 1 || txt.Values[0] != `"v=spf1 -all"` {
 		t.Fatalf("TXT got=%+v", txt)
 	}
 
