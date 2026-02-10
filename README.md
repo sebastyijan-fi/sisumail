@@ -55,6 +55,6 @@ See `docs/dns-records.md` for the exact per-user record templates.
 Near-term build targets (in order):
 - Make Tier 2 a real spool MX service (TLS cert for `spool.<zone>`, listen on `:25`, stream-encrypt-on-ingest, ciphertext-only store).
 - Production-grade relay controls for Tier 1 (caps/timeouts/backpressure as MUSTs from `WHITEPAPER.md`).
-- DNS provisioning on claim using Hetzner DNS API token (env-driven).
-- Safer operator workflow: systemd units + `git pull && rebuild && restart`.
+- DNS provisioning on claim using Hetzner Console DNS (Cloud API) token (`HCLOUD_TOKEN`).
+- Safer operator workflow: release binaries + `deploy/install.sh` + `sisumail-update` timer.
 - Client UX: Maildir storage + minimal TUI.

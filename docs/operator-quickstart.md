@@ -9,7 +9,7 @@ If you only want to run a personal always-on node that connects to an existing r
 Working today:
 - Tier 1 proxy + SSH gateway (dev ports by default).
 - Identity registry (SQLite) and first-come claim semantics.
-- Hetzner DNS client + provisioning logic exists and is wired into the relay **if** env vars are present.
+- Hetzner Console DNS (Cloud API) provisioning exists and is wired into the relay **if** env vars are present.
 
 Not production-ready yet:
 - Tier 2 spooler deployed as a real MX on port 25 with a publicly trusted TLS cert for `spool.<zone>`.
@@ -22,7 +22,7 @@ Not production-ready yet:
   - 1 static IPv4
   - a routed IPv6 /64 (preferred) or a provider-supported equivalent
 - A domain you control (example: `sisumail.fi`)
-- DNS hosted at **Hetzner DNS** (token must be from `dns.hetzner.com`, not Hetzner Cloud)
+- DNS zone managed in **Hetzner Console DNS** (Zones API via Hetzner Cloud API token).
 
 ## 1) Provision DNS (Split MX Model)
 
@@ -90,7 +90,7 @@ mkdir -p /var/lib/sisumail /var/spool/sisumail
 chmod 700 /var/lib/sisumail
 ```
 
-## 7) Configure Secrets (Hetzner DNS Token)
+## 7) Configure Secrets (Hetzner Console DNS Token)
 
 Create `/etc/sisumail.env` with mode `0600`:
 
