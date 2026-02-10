@@ -12,7 +12,7 @@ Working today:
 - Hetzner Console DNS (Cloud API) provisioning exists and is wired into the relay **if** env vars are present.
 
 Not production-ready yet:
-- Tier 2 spooler deployed as a real MX on port 25 with a publicly trusted TLS cert for `spool.<zone>`.
+- Tier 2 spooler deployed as a real public MX on port 25 with a publicly trusted TLS cert for `spool.<zone>` (we currently run Tier 2 in staging on `127.0.0.1:2526`).
 - Relay-level DoS hardening (rate limits, bandwidth caps, backpressure) is not complete.
 - Safe port-22 migration plan (product SSH on `:22` while keeping admin access) is not finalized.
 

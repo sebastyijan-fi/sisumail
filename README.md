@@ -12,8 +12,8 @@ Working today (local harness + current relay):
 - Identity registry (SQLite) with first-come claim semantics and per-user IPv6 allocation from a /64.
 
 Not working yet / not complete (do not assume production-ready):
-- Tier 2 SMTP receiver running on `spool.<zone>` on real port 25 with a publicly trusted TLS certificate.
-- Tier 2 encrypted spool storage and delivery signaling integrated end-to-end (code exists in `internal/tier2`, but deployment wiring is incomplete).
+- Tier 2 as a real public MX on `spool.<zone>:25` with a publicly trusted TLS certificate (we currently run it in staging on `127.0.0.1:2526` via `sisumail-tier2`).
+- Tier 2 delivery signaling integrated end-to-end (today it can spool ciphertext, but there is no real-time notify-to-client path yet).
 - ACME DNS-01 certificate issuance for Tier 1 device certificates (control channel not implemented).
 - TUI (Bubbletea) and mailbox UX (listing/reading mail) beyond the basic harness logging.
 - Relay hardening requirements from the whitepaper (rate limits, bandwidth caps, backpressure, strict timeouts) are not fully implemented.

@@ -57,6 +57,7 @@ fetch_release() {
 
   install -d -m 0755 "${BIN_DIR}"
   install -m 0755 /tmp/sisumail-install/sisumail-relay "${BIN_DIR}/sisumail-relay"
+  install -m 0755 /tmp/sisumail-install/sisumail-tier2 "${BIN_DIR}/sisumail-tier2"
   install -m 0755 /tmp/sisumail-install/sisumail "${BIN_DIR}/sisumail"
 }
 
@@ -81,6 +82,33 @@ ExecStart=/usr/local/bin/sisumail-relay \
   -tier1-listen :2525 \
   -db /var/lib/sisumail/relay.db \
   -hostkey /var/lib/sisumail/hostkey_ed25519
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail /var/spool/sisumail
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/sisumail-tier2.service <<'EOF'
+[Unit]
+Description=Sisumail Tier 2 Spool (staging port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sisumail.env
+ExecStart=/bin/sh -c '/usr/local/bin/sisumail-tier2 \
+  -listen 127.0.0.1:2526 \
+  -zone "$SISUMAIL_DNS_ZONE" \
+  -db /var/lib/sisumail/relay.db \
+  -spool-dir /var/spool/sisumail'
 Restart=always
 RestartSec=2
 
@@ -150,12 +178,15 @@ curl -fsSLo "${tmp}/sha256sum.txt" "${base}/download/${tag}/sha256sum.txt"
 
 tar -C "${tmp}" -xzf "${tmp}/${fname}"
 install -m 0755 "${tmp}/sisumail-relay" "${BIN_DIR}/sisumail-relay"
+install -m 0755 "${tmp}/sisumail-tier2" "${BIN_DIR}/sisumail-tier2"
 install -m 0755 "${tmp}/sisumail" "${BIN_DIR}/sisumail"
 
 systemctl restart sisumail-relay
+systemctl restart sisumail-tier2 || true
 EOF
 
   chmod 0644 /etc/systemd/system/sisumail-relay.service
+  chmod 0644 /etc/systemd/system/sisumail-tier2.service
   chmod 0644 /etc/systemd/system/sisumail-update.service
   chmod 0644 /etc/systemd/system/sisumail-update.timer
   chmod 0755 "${LIB_DIR}/update.sh"
@@ -206,9 +237,11 @@ main() {
   install_systemd_units
 
   systemctl enable --now sisumail-relay.service
+  systemctl enable --now sisumail-tier2.service
   systemctl enable --now sisumail-update.timer
 
   echo "installed: ${BIN_DIR}/sisumail-relay"
+  echo "installed: ${BIN_DIR}/sisumail-tier2"
   echo "next: edit ${ENV_FILE} and restart relay"
 }
 
