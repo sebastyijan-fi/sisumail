@@ -1,0 +1,29 @@
+$ORIGIN sisumail.fi.
+$TTL 300
+
+; ---- SOA / NS (Hetzner DNS typically uses these) ----
+@   IN SOA  ns1.hetzner.com. hostmaster.sisumail.fi. (
+        2026021001 ; serial (YYYYMMDDNN)
+        3600       ; refresh
+        900        ; retry
+        1209600    ; expire
+        300        ; minimum
+)
+    IN NS   ns1.hetzner.com.
+    IN NS   ns2.hetzner.com.
+    IN NS   ns3.hetzner.com.
+
+; ---- Base hosts ----
+@               IN A     37.27.19.170
+@               IN AAAA  2a01:4f9:c013:b8b6::1
+
+spool           IN A     37.27.19.170
+spool           IN AAAA  2a01:4f9:c013:b8b6::1
+
+; ---- Per-user Tier 1 target (test user: niklas) ----
+v6.niklas       IN AAAA  2a01:4f9:c013:b8b6::1234
+
+; ---- Split MX for user domain (niklas.sisumail.fi) ----
+niklas          IN MX 10 v6.niklas.sisumail.fi.
+niklas          IN MX 20 spool.sisumail.fi.
+

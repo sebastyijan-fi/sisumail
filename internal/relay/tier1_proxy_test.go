@@ -1,0 +1,156 @@
+package relay
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/sisumail/sisumail/internal/proto"
+	"golang.org/x/crypto/ssh"
+)
+
+type fakeConn struct {
+	open func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error)
+}
+
+func (c *fakeConn) OpenChannel(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+	return c.open(name, data)
+}
+
+type fakeChannel struct {
+	net.Conn
+	stderr io.ReadWriter
+}
+
+func (c *fakeChannel) CloseWrite() error { return nil }
+func (c *fakeChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+	return false, nil
+}
+func (c *fakeChannel) Stderr() io.ReadWriter {
+	if c.stderr == nil {
+		c.stderr = bytes.NewBuffer(nil)
+	}
+	return c.stderr
+}
+
+func TestTier1FastFailWhenOffline(t *testing.T) {
+	reg := NewSessionRegistry()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	p := &Tier1Proxy{
+		Listener:     ln,
+		DevRouteUser: "niklas",
+		Registry:     reg,
+		FastFail:     200 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = p.Run(ctx) }()
+
+	addr := ln.Addr().String()
+
+	// Dial and expect immediate close (RST/FIN) with no session.
+	start := time.Now()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1)
+	n, rerr := c.Read(buf)
+	if n != 0 || rerr == nil {
+		t.Fatalf("expected connection closed quickly, got n=%d err=%v", n, rerr)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("close took too long: %s", time.Since(start))
+	}
+}
+
+func TestTier1PipesBytesAndPreface(t *testing.T) {
+	reg := NewSessionRegistry()
+
+	// Create a fake ssh channel backed by net.Pipe.
+	serverSide, clientSide := net.Pipe()
+	ch := &fakeChannel{Conn: serverSide}
+
+	reqCh := make(chan *ssh.Request)
+	close(reqCh)
+
+	reg.SetSession("niklas", &Session{
+		Username: "niklas",
+		Conn: &fakeConn{open: func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+			return ch, reqCh, nil
+		}},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	p := &Tier1Proxy{
+		Listener:     ln,
+		DevRouteUser: "niklas",
+		Registry:     reg,
+		FastFail:     200 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Run(ctx) }()
+
+	in, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer in.Close()
+
+	// From sender -> relay -> ssh channel.
+	if _, err := in.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	br := bufio.NewReader(clientSide)
+	meta, err := proto.ReadSMTPDeliveryPreface(br)
+	if err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+	if meta.SenderPort == 0 {
+		t.Fatalf("expected sender port")
+	}
+
+	msg := make([]byte, 5)
+	if _, err := io.ReadFull(br, msg); err != nil {
+		t.Fatalf("read msg: %v", err)
+	}
+	if string(msg) != "hello" {
+		t.Fatalf("msg: got %q", string(msg))
+	}
+
+	// From ssh channel -> relay -> sender.
+	if _, err := clientSide.Write([]byte("world")); err != nil {
+		t.Fatalf("write back: %v", err)
+	}
+	rb := make([]byte, 5)
+	_ = in.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, err := io.ReadFull(in, rb); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(rb) != "world" {
+		t.Fatalf("back: got %q", string(rb))
+	}
+}

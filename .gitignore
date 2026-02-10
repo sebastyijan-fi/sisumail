@@ -1,0 +1,14 @@
+# Go build artifacts
+/bin/
+/*.exe
+*.out
+
+# Local config
+/config/relay.toml
+/config/client.toml
+
+# Local state
+/data/
+/spool/
+/certs/
+

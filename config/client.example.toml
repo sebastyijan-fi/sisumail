@@ -1,0 +1,22 @@
+# Sisumail Client / Node Configuration (example)
+
+[identity]
+username = "niklas"
+ssh_key_path = "~/.ssh/id_ed25519"
+
+[relay]
+addr = "sisumail.fi:22"
+
+[smtp]
+# Local SMTP daemon bind (only reachable through SSH channels from the relay).
+listen = "127.0.0.1:2525"
+
+[storage]
+maildir = "~/.local/share/sisumail/maildir"
+
+[tls]
+# Bootstrap policy (choose one at build time / runtime policy):
+# - strict: require publicly trusted ACME cert before advertising STARTTLS
+# - pragmatic: allow temporary self-signed for encryption, label auth separately
+bootstrap_policy = "pragmatic"
+
