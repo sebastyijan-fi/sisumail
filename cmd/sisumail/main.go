@@ -23,6 +23,7 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/sisumail/sisumail/internal/core"
 	"github.com/sisumail/sisumail/internal/store/chatlog"
+	"github.com/sisumail/sisumail/internal/store/knownkeys"
 	"github.com/sisumail/sisumail/internal/store/maildir"
 	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/tier2"
@@ -47,6 +48,7 @@ func main() {
 		chatMsg    = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
 		chatWith   = flag.String("chat-with", "", "interactive chat session with username")
 		chatDir    = flag.String("chat-dir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "chat"), "local chat history directory")
+		knownKeysPath = flag.String("known-keys", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "known_keys.json"), "pinned peer key fingerprints")
 		chatHistory = flag.String("chat-history", "", "print chat history with username and exit")
 		chatLimit  = flag.Int("chat-limit", 100, "max chat history lines for -chat-history (0 = unlimited)")
 	)
@@ -63,6 +65,7 @@ func main() {
 	if err := chats.Init(); err != nil {
 		log.Fatalf("chatlog init: %v", err)
 	}
+	known := &knownkeys.Store{Path: *knownKeysPath}
 
 	if *inboxMode {
 		if err := printInbox(store); err != nil {
@@ -186,7 +189,7 @@ func main() {
 		if strings.TrimSpace(*chatMsg) == "" {
 			log.Fatalf("-chat-msg is required with -chat-to")
 		}
-		if err := sendChat(client, *chatTo, *chatMsg); err != nil {
+		if err := sendChat(client, known, *chatTo, *chatMsg); err != nil {
 			log.Printf("chat send failed: %v", err)
 		} else {
 			_ = chats.Append(*chatTo, "out", strings.TrimSpace(*chatMsg), time.Now())
@@ -197,7 +200,7 @@ func main() {
 		}
 	}
 	if strings.TrimSpace(*chatWith) != "" {
-		if err := runChatREPL(client, chats, *chatWith); err != nil {
+		if err := runChatREPL(client, chats, known, *chatWith); err != nil {
 			log.Printf("chat session failed: %v", err)
 		}
 		if !*tuiMode {
@@ -206,7 +209,7 @@ func main() {
 	}
 
 	if *tuiMode {
-		if err := runInboxTUI(store); err != nil {
+		if err := runInboxTUI(store, client, chats, known); err != nil {
 			log.Printf("tui error: %v", err)
 		}
 		cancel()
@@ -323,8 +326,8 @@ func handleChatDeliveryChannel(ch ssh.NewChannel, sshPrivKey string, chats *chat
 	_ = proto.WriteChatAck(channel, h.MessageID)
 }
 
-func sendChat(client *ssh.Client, toUser, message string) error {
-	pubKey, err := lookupUserPubKey(client, toUser)
+func sendChat(client *ssh.Client, known *knownkeys.Store, toUser, message string) error {
+	pubKey, fp, err := lookupAndTrustUserPubKey(client, known, toUser)
 	if err != nil {
 		return fmt.Errorf("lookup %s: %w", toUser, err)
 	}
@@ -347,10 +350,13 @@ func sendChat(client *ssh.Client, toUser, message string) error {
 		return err
 	}
 	_, err = io.Copy(ch, &ct)
+	if err == nil && strings.TrimSpace(fp) != "" {
+		log.Printf("chat peer key: user=%s fp=%s", toUser, fp)
+	}
 	return err
 }
 
-func runChatREPL(client *ssh.Client, chats *chatlog.Store, peer string) error {
+func runChatREPL(client *ssh.Client, chats *chatlog.Store, known *knownkeys.Store, peer string) error {
 	peer = strings.TrimSpace(peer)
 	if peer == "" {
 		return fmt.Errorf("empty peer")
@@ -377,7 +383,7 @@ func runChatREPL(client *ssh.Client, chats *chatlog.Store, peer string) error {
 			continue
 		}
 
-		if err := sendChat(client, peer, msg); err != nil {
+		if err := sendChat(client, known, peer, msg); err != nil {
 			fmt.Printf("send failed: %v\n", err)
 			continue
 		}
@@ -400,6 +406,39 @@ func lookupUserPubKey(client *ssh.Client, username string) (string, error) {
 		return "", err
 	}
 	return proto.ReadKeyLookupResponse(ch)
+}
+
+func lookupAndTrustUserPubKey(client *ssh.Client, known *knownkeys.Store, username string) (pubKey string, fingerprint string, err error) {
+	pub, err := lookupUserPubKey(client, username)
+	if err != nil {
+		return "", "", err
+	}
+	fp, err := sshFingerprint(pub)
+	if err != nil {
+		return "", "", err
+	}
+	if known != nil {
+		status, prev, err := known.CheckAndUpdate(username, fp)
+		if err != nil {
+			log.Printf("known-keys update failed user=%s err=%v", username, err)
+		} else {
+			switch status {
+			case "new":
+				log.Printf("chat peer key pinned: user=%s fp=%s", username, fp)
+			case "changed":
+				log.Printf("WARNING: chat peer key changed: user=%s old=%s new=%s", username, prev, fp)
+			}
+		}
+	}
+	return pub, fp, nil
+}
+
+func sshFingerprint(pubKeyText string) (string, error) {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubKeyText))
+	if err != nil {
+		return "", err
+	}
+	return ssh.FingerprintSHA256(pub), nil
 }
 
 type localBackend struct {
@@ -626,7 +665,7 @@ func readSummaryInfo(store *maildir.Store, id string, tier string) summaryInfo {
 	return sum
 }
 
-func runInboxTUI(store *maildir.Store) error {
+func runInboxTUI(store *maildir.Store, client *ssh.Client, chats *chatlog.Store, known *knownkeys.Store) error {
 	in := bufio.NewReader(os.Stdin)
 	filter := inboxFilterAll
 	search := ""
@@ -672,7 +711,7 @@ func runInboxTUI(store *maildir.Store) error {
 			}
 		}
 		fmt.Println()
-		fmt.Print("Command [number=open, m/d/x <n>, a|1|2|u filter, /term search, / clear, n/p page, r refresh, q quit]: ")
+		fmt.Print("Command [number=open, m/d/x <n>, a|1|2|u filter, /term search, / clear, n/p page, h <user>, c <user> <msg>, r refresh, q quit]: ")
 
 		line, err := in.ReadString('\n')
 		if err != nil {
@@ -718,6 +757,41 @@ func runInboxTUI(store *maildir.Store) error {
 		if strings.HasPrefix(cmd, "/") {
 			search = strings.TrimSpace(strings.TrimPrefix(cmd, "/"))
 			page = 1
+			continue
+		}
+		if strings.HasPrefix(cmd, "h ") {
+			peer := strings.TrimSpace(strings.TrimPrefix(cmd, "h "))
+			if peer == "" {
+				fmt.Println("usage: h <user>")
+				continue
+			}
+			if chats == nil {
+				fmt.Println("chat history unavailable")
+				continue
+			}
+			_ = printChatHistory(chats, peer, 30)
+			fmt.Print("Press Enter to return to inbox...")
+			_, _ = in.ReadString('\n')
+			continue
+		}
+		if strings.HasPrefix(cmd, "c ") {
+			peer, msg, ok := parseChatSendCommand(cmd)
+			if !ok {
+				fmt.Println("usage: c <user> <message>")
+				continue
+			}
+			if client == nil {
+				fmt.Println("chat send unavailable (no relay connection)")
+				continue
+			}
+			if err := sendChat(client, known, peer, msg); err != nil {
+				fmt.Printf("chat send failed: %v\n", err)
+				continue
+			}
+			if chats != nil {
+				_ = chats.Append(peer, "out", msg, time.Now())
+			}
+			fmt.Println("chat sent")
 			continue
 		}
 
@@ -972,4 +1046,21 @@ func nonEmpty(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func parseChatSendCommand(cmd string) (peer string, msg string, ok bool) {
+	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "c "))
+	if rest == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(rest, " ", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	peer = strings.TrimSpace(parts[0])
+	msg = strings.TrimSpace(parts[1])
+	if peer == "" || msg == "" {
+		return "", "", false
+	}
+	return peer, msg, true
 }

@@ -134,3 +134,16 @@ func TestTrustSummary(t *testing.T) {
 		t.Fatalf("tier2 none: got %q", got)
 	}
 }
+
+func TestParseChatSendCommand(t *testing.T) {
+	peer, msg, ok := parseChatSendCommand("c bob hello world")
+	if !ok || peer != "bob" || msg != "hello world" {
+		t.Fatalf("parse failed: ok=%v peer=%q msg=%q", ok, peer, msg)
+	}
+	if _, _, ok := parseChatSendCommand("c bob"); ok {
+		t.Fatal("expected parse failure without message")
+	}
+	if _, _, ok := parseChatSendCommand("c "); ok {
+		t.Fatal("expected parse failure with empty command")
+	}
+}

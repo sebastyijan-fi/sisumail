@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +53,12 @@ func main() {
 		allowClaim  = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
 		spoolDir    = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
 		chatSpoolDir = flag.String("chat-spool-dir", "/var/spool/sisumail/chat", "encrypted chat queue root (for offline delivery)")
+		chatMaxBytes = flag.Int64("chat-max-bytes", 64<<10, "max encrypted chat payload bytes per message")
+		chatLookupPerMin = flag.Int("chat-lookup-per-min", 120, "max key-lookup requests per source IP per minute")
+		chatSendPerMin = flag.Int("chat-send-per-min", 240, "max chat-send requests per source IP per minute")
+		chatSendPerUserPerMin = flag.Int("chat-send-per-user-per-min", 120, "max chat-send requests per sender username per minute")
+		chatReadTimeoutMS = flag.Int("chat-read-timeout-ms", 5000, "chat channel read/header timeout in milliseconds")
+		chatForwardTimeoutMS = flag.Int("chat-forward-timeout-ms", 5000, "chat forward/copy timeout in milliseconds")
 	)
 	flag.Parse()
 
@@ -161,9 +169,17 @@ func main() {
 	spool := &tier2.FileSpool{Root: *spoolDir}
 	chatSpool := &chatqueue.Store{Root: *chatSpoolDir}
 	spoolPump := newSpoolDeliveryPump()
+	chatGuard := newChatGuard(chatGuardConfig{
+		MaxBytes:          *chatMaxBytes,
+		LookupPerMinute:   *chatLookupPerMin,
+		SendPerMinuteIP:   *chatSendPerMin,
+		SendPerMinuteUser: *chatSendPerUserPerMin,
+		ReadTimeout:       time.Duration(*chatReadTimeoutMS) * time.Millisecond,
+		ForwardTimeout:    time.Duration(*chatForwardTimeoutMS) * time.Millisecond,
+	})
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, spoolPump); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -234,7 +250,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, pump *spoolDeliveryPump) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -258,11 +274,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, pump)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, pump *spoolDeliveryPump) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -275,6 +291,7 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	if user == "" {
 		return
 	}
+	source := remoteIPString(sshConn.RemoteAddr())
 
 	reg.SetSession(user, &relay.Session{Username: user, Conn: sshConn})
 	log.Printf("ssh session registered: user=%s remote=%s", user, sshConn.RemoteAddr())
@@ -315,9 +332,9 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
 					_ = c.Close()
 				case "key-lookup":
-					handleKeyLookupChannel(ch, store)
+					handleKeyLookupChannel(ch, store, source, chatGuard)
 				case "chat-send":
-					handleChatSendChannel(ch, user, reg, chatSpool)
+					handleChatSendChannel(ch, user, source, reg, chatSpool, chatGuard)
 				default:
 					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
 					return
@@ -327,7 +344,7 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	}
 }
 
-func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store) {
+func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store, source string, guard *chatGuard) {
 	c, reqs, err := ch.Accept()
 	if err != nil {
 		return
@@ -335,12 +352,19 @@ func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store) {
 	go ssh.DiscardRequests(reqs)
 	defer c.Close()
 
+	if guard != nil && !guard.allowLookup(source) {
+		return
+	}
 	if store == nil {
 		_ = proto.WriteKeyLookupResponse(c, "")
 		return
 	}
-	u, err := proto.ReadKeyLookupRequest(c)
+	u, err := readChatLookupRequestWithTimeout(c, guardReadTimeout(guard))
 	if err != nil {
+		return
+	}
+	if !isLookupUsernameAllowed(u) {
+		_ = proto.WriteKeyLookupResponse(c, "")
 		return
 	}
 	id, err := store.GetByUsername(context.Background(), u)
@@ -351,7 +375,7 @@ func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store) {
 	_ = proto.WriteKeyLookupResponse(c, id.PubKeyText)
 }
 
-func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionRegistry, chatSpool *chatqueue.Store) {
+func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, guard *chatGuard) {
 	c, reqs, err := ch.Accept()
 	if err != nil {
 		return
@@ -359,11 +383,17 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionR
 	go ssh.DiscardRequests(reqs)
 	defer c.Close()
 
-	h, br, err := proto.ReadChatSendHeader(c)
+	if guard != nil && (!guard.allowSendBySource(source) || !guard.allowSendByUser(sender)) {
+		return
+	}
+	h, br, err := readChatSendHeaderWithTimeout(c, guardReadTimeout(guard))
 	if err != nil {
 		return
 	}
 	if reg == nil || strings.TrimSpace(h.To) == "" || h.SizeBytes < 0 {
+		return
+	}
+	if guard != nil && guard.maxBytes > 0 && h.SizeBytes > guard.maxBytes {
 		return
 	}
 	dst, ok := reg.GetSession(h.To)
@@ -405,7 +435,7 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionR
 	if err := proto.WriteChatDeliveryHeader(out, dh); err != nil {
 		return
 	}
-	_, _ = io.CopyN(out, br, h.SizeBytes)
+	_, _ = copyNWithTimeout(out, br, h.SizeBytes, guardForwardTimeout(guard))
 }
 
 func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool) {
@@ -458,6 +488,176 @@ func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user
 			// Keep queued entry for retry on next reconnect.
 		}
 		_ = ch.Close()
+	}
+}
+
+func remoteIPString(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil && strings.TrimSpace(host) != "" {
+		return host
+	}
+	return addr.String()
+}
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+func isLookupUsernameAllowed(u string) bool {
+	u = strings.TrimSpace(strings.ToLower(u))
+	if !usernamePattern.MatchString(u) {
+		return false
+	}
+	if isReservedUsername(u) {
+		return false
+	}
+	return true
+}
+
+type chatGuardConfig struct {
+	MaxBytes          int64
+	LookupPerMinute   int
+	SendPerMinuteIP   int
+	SendPerMinuteUser int
+	ReadTimeout       time.Duration
+	ForwardTimeout    time.Duration
+}
+
+type chatGuard struct {
+	maxBytes       int64
+	readTimeout    time.Duration
+	forwardTimeout time.Duration
+
+	mu              sync.Mutex
+	lookupBySource  map[string]*rateWindow
+	sendBySource    map[string]*rateWindow
+	sendByUser      map[string]*rateWindow
+	lookupLimit     int
+	sendSourceLimit int
+	sendUserLimit   int
+}
+
+type rateWindow struct {
+	start time.Time
+	count int
+}
+
+func newChatGuard(cfg chatGuardConfig) *chatGuard {
+	return &chatGuard{
+		maxBytes:        cfg.MaxBytes,
+		readTimeout:     cfg.ReadTimeout,
+		forwardTimeout:  cfg.ForwardTimeout,
+		lookupBySource:  make(map[string]*rateWindow),
+		sendBySource:    make(map[string]*rateWindow),
+		sendByUser:      make(map[string]*rateWindow),
+		lookupLimit:     cfg.LookupPerMinute,
+		sendSourceLimit: cfg.SendPerMinuteIP,
+		sendUserLimit:   cfg.SendPerMinuteUser,
+	}
+}
+
+func (g *chatGuard) allowLookup(source string) bool {
+	return g.allow(g.lookupBySource, source, g.lookupLimit)
+}
+
+func (g *chatGuard) allowSendBySource(source string) bool {
+	return g.allow(g.sendBySource, source, g.sendSourceLimit)
+}
+
+func (g *chatGuard) allowSendByUser(user string) bool {
+	return g.allow(g.sendByUser, strings.ToLower(strings.TrimSpace(user)), g.sendUserLimit)
+}
+
+func (g *chatGuard) allow(m map[string]*rateWindow, key string, limit int) bool {
+	if g == nil || limit <= 0 {
+		return true
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "unknown"
+	}
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	w, ok := m[key]
+	if !ok || now.Sub(w.start) >= time.Minute {
+		m[key] = &rateWindow{start: now, count: 1}
+		return true
+	}
+	if w.count >= limit {
+		return false
+	}
+	w.count++
+	return true
+}
+
+func guardReadTimeout(g *chatGuard) time.Duration {
+	if g == nil || g.readTimeout <= 0 {
+		return 5 * time.Second
+	}
+	return g.readTimeout
+}
+
+func guardForwardTimeout(g *chatGuard) time.Duration {
+	if g == nil || g.forwardTimeout <= 0 {
+		return 5 * time.Second
+	}
+	return g.forwardTimeout
+}
+
+func readChatLookupRequestWithTimeout(r io.Reader, timeout time.Duration) (string, error) {
+	type res struct {
+		u   string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		u, err := proto.ReadKeyLookupRequest(r)
+		ch <- res{u: u, err: err}
+	}()
+	select {
+	case out := <-ch:
+		return out.u, out.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("lookup read timeout")
+	}
+}
+
+func readChatSendHeaderWithTimeout(r io.Reader, timeout time.Duration) (proto.ChatSendHeader, *bufio.Reader, error) {
+	type res struct {
+		h   proto.ChatSendHeader
+		br  *bufio.Reader
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		h, br, err := proto.ReadChatSendHeader(r)
+		ch <- res{h: h, br: br, err: err}
+	}()
+	select {
+	case out := <-ch:
+		return out.h, out.br, out.err
+	case <-time.After(timeout):
+		return proto.ChatSendHeader{}, nil, fmt.Errorf("chat header read timeout")
+	}
+}
+
+func copyNWithTimeout(dst io.Writer, src io.Reader, n int64, timeout time.Duration) (int64, error) {
+	type res struct {
+		n   int64
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		w, err := io.CopyN(dst, src, n)
+		ch <- res{n: w, err: err}
+	}()
+	select {
+	case out := <-ch:
+		return out.n, out.err
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("copy timeout")
 	}
 }
 
