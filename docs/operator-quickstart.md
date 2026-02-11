@@ -113,6 +113,7 @@ SISUMAIL_TIER1_MAX_CONN_DURATION_MS=600000
 SISUMAIL_TIER1_MAX_BYTES_PER_CONN=10485760
 SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
 SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
+SISUMAIL_ACME_DNS01_PER_USER_PER_MIN=30
 EOF
 chmod 0600 /etc/sisumail.env
 ```
@@ -202,6 +203,10 @@ Tier 2 denylist file format (`SISUMAIL_TIER2_DENYLIST_PATH`):
 198.51.100.0/24
 2001:db8:bad::/48
 ```
+
+Relay ACME control channel:
+- When `HCLOUD_TOKEN`, `SISUMAIL_DNS_ZONE`, and `SISUMAIL_IPV6_PREFIX` are configured, the relay also enables authenticated `acme-dns01` control for connected users.
+- Nodes can run `sisumail -acme-dns01` without local DNS API tokens (default behavior uses relay channel).
 
 ## 10) Production Cutover (Later)
 

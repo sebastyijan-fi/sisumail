@@ -45,6 +45,7 @@ func main() {
 		certPath            = flag.String("tls-cert", "", "path to TLS cert PEM (optional; ACME will populate later)")
 		keyPemPath          = flag.String("tls-key", "", "path to TLS key PEM (optional; ACME will populate later)")
 		acmeDNS01Enabled    = flag.Bool("acme-dns01", false, "enable ACME DNS-01 certificate automation")
+		acmeViaRelay        = flag.Bool("acme-via-relay", true, "use relay ACME DNS-01 control channel instead of direct DNS API token")
 		acmeDirectoryURL    = flag.String("acme-directory-url", "", "ACME directory URL (default: Let's Encrypt production)")
 		acmeEmail           = flag.String("acme-email", "", "optional ACME account email")
 		acmeAccountKeyPath  = flag.String("acme-account-key", "", "path to ACME account key PEM")
@@ -100,6 +101,30 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	sshKey, err := os.ReadFile(*keyPath)
+	if err != nil {
+		log.Fatalf("read key: %v", err)
+	}
+	signer, err := ssh.ParsePrivateKey(sshKey)
+	if err != nil {
+		log.Fatalf("parse key: %v", err)
+	}
+
+	sshCfg := &ssh.ClientConfig{
+		User: *user,
+		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		// Dev: accept anything; production will pin host keys.
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", *relayAddr, sshCfg)
+	if err != nil {
+		log.Fatalf("ssh dial: %v", err)
+	}
+	defer client.Close()
+	log.Printf("connected to relay %s as %s", *relayAddr, *user)
+
 	host := fmt.Sprintf("v6.%s.%s", *user, strings.TrimSuffix(*zone, "."))
 	if *acmeDNS01Enabled {
 		defaultDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "tls")
@@ -117,22 +142,27 @@ func main() {
 	var primary tlsboot.Provider
 	var acmePrimary *tlsboot.ACMEDNS01Provider
 	if *acmeDNS01Enabled {
-		token := loadHCloudToken()
-		if strings.TrimSpace(token) == "" {
-			log.Fatalf("acme dns-01 requires HCLOUD_TOKEN or HETZNER_CLOUD_TOKEN")
-		}
 		acmePrimary = &tlsboot.ACMEDNS01Provider{
 			Hostname:        host,
 			ZoneName:        strings.TrimSuffix(*zone, "."),
 			Email:           strings.TrimSpace(*acmeEmail),
 			DirectoryURL:    strings.TrimSpace(*acmeDirectoryURL),
-			DNSProvider:     hetznercloud.NewClient(token, strings.TrimSuffix(*zone, ".")),
 			CertPath:        *certPath,
 			KeyPath:         *keyPemPath,
 			AccountKeyPath:  *acmeAccountKeyPath,
 			RenewBefore:     *acmeRenewBefore,
 			PropagationWait: *acmePropagationWait,
 			IssueTimeout:    *acmeIssueTimeout,
+		}
+		if *acmeViaRelay {
+			presenter := &relayDNS01Presenter{client: client}
+			acmePrimary.PresentDNS01 = presenter.Present
+		} else {
+			token := loadHCloudToken()
+			if strings.TrimSpace(token) == "" {
+				log.Fatalf("acme dns-01 direct mode requires HCLOUD_TOKEN or HETZNER_CLOUD_TOKEN")
+			}
+			acmePrimary.DNSProvider = hetznercloud.NewClient(token, strings.TrimSuffix(*zone, "."))
 		}
 		primary = acmePrimary
 	} else if *certPath != "" && *keyPemPath != "" {
@@ -192,30 +222,6 @@ func main() {
 			cancel()
 		}
 	}()
-
-	sshKey, err := os.ReadFile(*keyPath)
-	if err != nil {
-		log.Fatalf("read key: %v", err)
-	}
-	signer, err := ssh.ParsePrivateKey(sshKey)
-	if err != nil {
-		log.Fatalf("parse key: %v", err)
-	}
-
-	sshCfg := &ssh.ClientConfig{
-		User: *user,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		// Dev: accept anything; production will pin host keys.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-
-	client, err := ssh.Dial("tcp", *relayAddr, sshCfg)
-	if err != nil {
-		log.Fatalf("ssh dial: %v", err)
-	}
-	defer client.Close()
-	log.Printf("connected to relay %s as %s", *relayAddr, *user)
 
 	// Accept channels from relay (smtp-delivery).
 	go func() {

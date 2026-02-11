@@ -35,7 +35,7 @@ In another terminal:
 ```bash
 go run ./cmd/sisumail -relay 127.0.0.1:2222 -user niklas -key ~/.ssh/id_ed25519 -smtp-listen 127.0.0.1:2526 -tls-policy pragmatic
 
-# Enable ACME DNS-01 automation (Hetzner DNS token via HCLOUD_TOKEN env).
+# Enable ACME DNS-01 automation via relay control channel (default).
 go run ./cmd/sisumail \
   -relay 127.0.0.1:2222 \
   -user niklas \
@@ -43,6 +43,16 @@ go run ./cmd/sisumail \
   -zone sisumail.fi \
   -tls-policy strict \
   -acme-dns01
+
+# Optional: direct DNS mode (node holds HCLOUD token).
+go run ./cmd/sisumail \
+  -relay 127.0.0.1:2222 \
+  -user niklas \
+  -key ~/.ssh/id_ed25519 \
+  -zone sisumail.fi \
+  -tls-policy strict \
+  -acme-dns01 \
+  -acme-via-relay=false
 ```
 
 ### 3) Simulate a sender delivering SMTP to Tier 1

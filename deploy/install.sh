@@ -88,6 +88,7 @@ ExecStart=/usr/local/bin/sisumail-relay \
   -tier1-max-bytes-per-conn "${SISUMAIL_TIER1_MAX_BYTES_PER_CONN:-10485760}" \
   -tier1-max-conns-per-user "${SISUMAIL_TIER1_MAX_CONNS_PER_USER:-10}" \
   -tier1-max-conns-per-source "${SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE:-20}" \
+  -acme-dns01-per-user-per-min "${SISUMAIL_ACME_DNS01_PER_USER_PER_MIN:-30}" \
   -db /var/lib/sisumail/relay.db \
   -hostkey /var/lib/sisumail/hostkey_ed25519
 Restart=always
@@ -231,6 +232,7 @@ ensure_env_file() {
 # SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN: per-source accepted message cap per minute
 # SISUMAIL_OBS_LISTEN: local observability endpoint, e.g. 127.0.0.1:9090
 # SISUMAIL_TIER1_*: Tier 1 hardening controls.
+# SISUMAIL_ACME_DNS01_PER_USER_PER_MIN: relay ACME control-channel rate limit
 HCLOUD_TOKEN=
 SISUMAIL_DNS_ZONE=
 SISUMAIL_IPV6_PREFIX=
@@ -249,6 +251,7 @@ SISUMAIL_TIER1_MAX_CONN_DURATION_MS=600000
 SISUMAIL_TIER1_MAX_BYTES_PER_CONN=10485760
 SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
 SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
+SISUMAIL_ACME_DNS01_PER_USER_PER_MIN=30
 EOF
   chmod 0600 "${ENV_FILE}"
   echo "created ${ENV_FILE} (fill it in, then: systemctl restart sisumail-relay)"

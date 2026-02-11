@@ -28,6 +28,7 @@ type ACMEDNS01Provider struct {
 	Email          string
 	DirectoryURL   string
 	DNSProvider    core.DNSProvider
+	PresentDNS01   func(hostname, value string) (cleanup func(), err error)
 	CertPath       string
 	KeyPath        string
 	AccountKeyPath string
@@ -95,7 +96,7 @@ func (p *ACMEDNS01Provider) setDefaults() error {
 	if strings.TrimSpace(p.ZoneName) == "" {
 		return fmt.Errorf("missing acme zone")
 	}
-	if p.DNSProvider == nil {
+	if p.DNSProvider == nil && p.PresentDNS01 == nil {
 		return fmt.Errorf("missing dns provider")
 	}
 	if strings.TrimSpace(p.CertPath) == "" || strings.TrimSpace(p.KeyPath) == "" || strings.TrimSpace(p.AccountKeyPath) == "" {
@@ -139,9 +140,12 @@ func (p *ACMEDNS01Provider) issueOrRenew(now time.Time) error {
 		return fmt.Errorf("acme order: %w", err)
 	}
 
-	zoneID, err := p.DNSProvider.GetZoneIDByName(p.ZoneName)
-	if err != nil {
-		return fmt.Errorf("acme zone id: %w", err)
+	var zoneID string
+	if p.PresentDNS01 == nil {
+		zoneID, err = p.DNSProvider.GetZoneIDByName(p.ZoneName)
+		if err != nil {
+			return fmt.Errorf("acme zone id: %w", err)
+		}
 	}
 
 	for _, authzURL := range order.AuthzURLs {
@@ -162,11 +166,18 @@ func (p *ACMEDNS01Provider) issueOrRenew(now time.Time) error {
 			return fmt.Errorf("acme challenge record: %w", err)
 		}
 
-		cleanup, err := p.presentDNS01Challenge(zoneID, record)
+		var cleanup func()
+		if p.PresentDNS01 != nil {
+			cleanup, err = p.PresentDNS01(p.Hostname, record)
+		} else {
+			cleanup, err = p.presentDNS01Challenge(zoneID, record)
+		}
 		if err != nil {
 			return fmt.Errorf("acme present challenge: %w", err)
 		}
-		defer cleanup()
+		if cleanup != nil {
+			defer cleanup()
+		}
 
 		if _, err := client.Accept(ctx, ch); err != nil {
 			return fmt.Errorf("acme accept challenge: %w", err)

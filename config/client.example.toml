@@ -22,5 +22,6 @@ bootstrap_policy = "pragmatic"
 
 # Optional ACME DNS-01 automation (requires HCLOUD_TOKEN in environment):
 # acme_dns01 = true
+# acme_via_relay = true
 # zone = "sisumail.fi"
 # acme_email = "you@example.com"

@@ -62,6 +62,7 @@ func main() {
 		chatSendPerUserPerMin  = flag.Int("chat-send-per-user-per-min", 120, "max chat-send requests per sender username per minute")
 		chatReadTimeoutMS      = flag.Int("chat-read-timeout-ms", 5000, "chat channel read/header timeout in milliseconds")
 		chatForwardTimeoutMS   = flag.Int("chat-forward-timeout-ms", 5000, "chat forward/copy timeout in milliseconds")
+		acmeDNS01PerMin        = flag.Int("acme-dns01-per-user-per-min", 30, "max ACME DNS-01 control operations per user per minute")
 		obsListen              = flag.String("obs-listen", "", "observability HTTP listen address (disabled when empty), e.g. 127.0.0.1:9090")
 		obsReadHeaderTimeoutMS = flag.Int("obs-read-header-timeout-ms", 5000, "observability HTTP read-header timeout in milliseconds")
 	)
@@ -115,6 +116,10 @@ func main() {
 
 	// DNS provisioner (optional; required for production auto-claim).
 	prov, ipv6Prefix := loadProvisioningFromEnv()
+	var acmeCtrl *acmeDNS01Controller
+	if prov != nil && prov.DNS != nil && strings.TrimSpace(prov.ZoneName) != "" {
+		acmeCtrl = newACMEDNS01Controller(prov.ZoneName, prov.DNS, *acmeDNS01PerMin)
+	}
 
 	// Dev SSH server: accepts any pubkey, binds by SSH username.
 	hostKey, err := loadOrCreateHostKey(*hostKeyPath)
@@ -187,7 +192,7 @@ func main() {
 	})
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump, stats, ready.setSSHListening); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump, acmeCtrl, stats, ready.setSSHListening); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -270,7 +275,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, stats *observability.RelayStats, onListening func()) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, stats *observability.RelayStats, onListening func()) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -297,11 +302,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump, stats)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump, acmeCtrl, stats)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, stats *observability.RelayStats) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, stats *observability.RelayStats) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -364,6 +369,8 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					handleKeyLookupChannel(ch, store, source, chatGuard, stats)
 				case "chat-send":
 					handleChatSendChannel(ch, user, source, reg, chatSpool, chatGuard, stats)
+				case "acme-dns01":
+					handleACMEDNS01Channel(ch, user, acmeCtrl)
 				default:
 					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
 					return
@@ -486,6 +493,44 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 	if stats != nil {
 		stats.IncChatDeliveredLive()
 	}
+}
+
+func handleACMEDNS01Channel(ch ssh.NewChannel, user string, ctrl *acmeDNS01Controller) {
+	c, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer c.Close()
+
+	if ctrl == nil || !ctrl.enabled() {
+		_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: false, Message: "acme dns control unavailable"})
+		return
+	}
+	req, err := proto.ReadACMEDNS01Request(c)
+	if err != nil {
+		_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: false, Message: "bad request"})
+		return
+	}
+
+	op := strings.ToUpper(strings.TrimSpace(req.Op))
+	switch op {
+	case "PRESENT":
+		if err := ctrl.present(user, req.Hostname, req.Value); err != nil {
+			_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: false, Message: err.Error()})
+			return
+		}
+	case "CLEANUP":
+		if err := ctrl.cleanup(user, req.Hostname, req.Value); err != nil {
+			_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: false, Message: err.Error()})
+			return
+		}
+	default:
+		_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: false, Message: "unsupported operation"})
+		return
+	}
+
+	_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: true})
 }
 
 func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool, stats *observability.RelayStats) {
