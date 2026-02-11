@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -13,12 +14,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/emersion/go-smtp"
+	"github.com/sisumail/sisumail/internal/core"
 	"github.com/sisumail/sisumail/internal/store/maildir"
 	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/tier2"
@@ -38,6 +41,7 @@ func main() {
 		maildirRoot = flag.String("maildir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "maildir"), "local Maildir root")
 		inboxMode  = flag.Bool("inbox", false, "list local inbox and exit")
 		readID     = flag.String("read-id", "", "read local message by ID and exit")
+		tuiMode    = flag.Bool("tui", false, "interactive local inbox view")
 	)
 	flag.Parse()
 
@@ -58,7 +62,6 @@ func main() {
 		}
 		return
 	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -152,6 +155,13 @@ func main() {
 			go handleSpoolChannel(ch, string(sshKey), store)
 		}
 	}()
+
+	if *tuiMode {
+		if err := runInboxTUI(store); err != nil {
+			log.Printf("tui error: %v", err)
+		}
+		cancel()
+	}
 
 	<-ctx.Done()
 	_ = srv.Close()
@@ -386,10 +396,14 @@ func printInbox(store *maildir.Store) error {
 		fmt.Println("inbox empty")
 		return nil
 	}
-	fmt.Printf("%-30s %-6s %-20s %s\n", "ID", "TIER", "FROM", "SUBJECT")
+	fmt.Printf("%-30s %-6s %-6s %-20s %s\n", "ID", "TIER", "STATE", "FROM", "SUBJECT")
 	for _, e := range entries {
 		from, subj := readSummary(store, e.ID)
-		fmt.Printf("%-30s %-6s %-20s %s\n", e.ID, strings.ToUpper(e.Tier), from, subj)
+		state := "unread"
+		if e.Seen {
+			state = "read"
+		}
+		fmt.Printf("%-30s %-6s %-6s %-20s %s\n", e.ID, strings.ToUpper(e.Tier), state, from, subj)
 	}
 	return nil
 }
@@ -427,4 +441,193 @@ func readSummary(store *maildir.Store, id string) (from string, subject string) 
 		subject = v
 	}
 	return from, subject
+}
+
+func runInboxTUI(store *maildir.Store) error {
+	in := bufio.NewReader(os.Stdin)
+	filter := inboxFilterAll
+
+	for {
+		entries, err := store.List()
+		if err != nil {
+			return err
+		}
+		view := applyInboxFilter(entries, filter)
+
+		fmt.Println()
+		fmt.Println("Sisumail Inbox (live)")
+		fmt.Println("==============")
+		fmt.Printf("Filter: %s\n", filter)
+		if len(view) == 0 {
+			fmt.Println("(empty)")
+		} else {
+			fmt.Printf("%-4s %-30s %-14s %-7s %-20s %s\n", "NO", "ID", "TIER", "STATE", "FROM", "SUBJECT")
+			for i, e := range view {
+				from, subj := readSummary(store, e.ID)
+				state := "unread"
+				if e.Seen {
+					state = "read"
+				}
+				fmt.Printf("%-4d %-30s %-14s %-7s %-20s %s\n", i+1, e.ID, tierBadge(e.Tier), state, from, subj)
+			}
+		}
+		fmt.Println()
+		fmt.Print("Command [number=open, m <n>=mark-read, a|1|2|u filter, r refresh, q quit]: ")
+
+		line, err := in.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		cmd := strings.TrimSpace(line)
+		switch cmd {
+		case "", "r":
+			continue
+		case "q":
+			return nil
+		case "a":
+			filter = inboxFilterAll
+			continue
+		case "1":
+			filter = inboxFilterTier1
+			continue
+		case "2":
+			filter = inboxFilterTier2
+			continue
+		case "u":
+			filter = inboxFilterUnread
+			continue
+		}
+
+		if strings.HasPrefix(cmd, "m ") {
+			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "m ")))
+			if err != nil || n < 1 || n > len(view) {
+				fmt.Println("invalid selection")
+				continue
+			}
+			if err := store.MarkRead(view[n-1].ID); err != nil {
+				fmt.Printf("mark-read failed: %v\n", err)
+			}
+			continue
+		}
+
+		n, err := strconv.Atoi(cmd)
+		if err != nil || n < 1 || n > len(view) {
+			fmt.Println("invalid selection")
+			continue
+		}
+		if err := store.MarkRead(view[n-1].ID); err != nil {
+			fmt.Printf("mark-read failed: %v\n", err)
+		}
+		if err := printMessageView(store, view[n-1].ID, in); err != nil {
+			fmt.Printf("open failed: %v\n", err)
+		}
+	}
+}
+
+type inboxFilter string
+
+const (
+	inboxFilterAll    inboxFilter = "all"
+	inboxFilterTier1  inboxFilter = "tier1"
+	inboxFilterTier2  inboxFilter = "tier2"
+	inboxFilterUnread inboxFilter = "unread"
+)
+
+func applyInboxFilter(entries []core.MaildirEntry, filter inboxFilter) []core.MaildirEntry {
+	if filter == inboxFilterAll {
+		return entries
+	}
+	out := make([]core.MaildirEntry, 0, len(entries))
+	for _, e := range entries {
+		switch filter {
+		case inboxFilterTier1:
+			if strings.EqualFold(e.Tier, "tier1") {
+				out = append(out, e)
+			}
+		case inboxFilterTier2:
+			if strings.EqualFold(e.Tier, "tier2") {
+				out = append(out, e)
+			}
+		case inboxFilterUnread:
+			if !e.Seen {
+				out = append(out, e)
+			}
+		default:
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func printMessageView(store *maildir.Store, id string, in *bufio.Reader) error {
+	rc, err := store.Read(id)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	m, err := mail.ReadMessage(rc)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Printf("Message %s\n", id)
+	fmt.Println(strings.Repeat("-", 72))
+	fmt.Printf("Tier: %s\n", tierBadge(m.Header.Get("X-Sisumail-Tier")))
+	fmt.Printf("From: %s\n", nonEmpty(m.Header.Get("From")))
+	fmt.Printf("To: %s\n", nonEmpty(m.Header.Get("To")))
+	fmt.Printf("Subject: %s\n", nonEmpty(m.Header.Get("Subject")))
+	fmt.Printf("Date: %s\n", nonEmpty(m.Header.Get("Date")))
+
+	if v := m.Header.Get("X-Sisumail-Sender-IP"); v != "" {
+		fmt.Printf("Sender IP: %s\n", v)
+	}
+	if v := m.Header.Get("X-Sisumail-Sender-Port"); v != "" {
+		fmt.Printf("Sender Port: %s\n", v)
+	}
+	if v := m.Header.Get("X-Sisumail-Dest-IP"); v != "" {
+		fmt.Printf("Dest IP: %s\n", v)
+	}
+	if v := m.Header.Get("X-Sisumail-Received-At"); v != "" {
+		fmt.Printf("Received At: %s\n", v)
+	}
+	if v := m.Header.Get("X-Sisumail-Spool-Message-ID"); v != "" {
+		fmt.Printf("Spool Message ID: %s\n", v)
+	}
+	if v := m.Header.Get("X-Sisumail-Spool-Size"); v != "" {
+		fmt.Printf("Spool Size: %s\n", v)
+	}
+
+	body, _ := io.ReadAll(m.Body)
+	fmt.Println(strings.Repeat("-", 72))
+	fmt.Print(string(body))
+	if len(body) == 0 || body[len(body)-1] != '\n' {
+		fmt.Println()
+	}
+	fmt.Println(strings.Repeat("-", 72))
+	fmt.Print("Press Enter to return to inbox...")
+	_, _ = in.ReadString('\n')
+	return nil
+}
+
+func tierBadge(tier string) string {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "tier1":
+		return "Tier1 Blind"
+	case "tier2":
+		return "Tier2 Spool"
+	default:
+		if strings.TrimSpace(tier) == "" {
+			return "Unknown"
+		}
+		return tier
+	}
+}
+
+func nonEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
 }

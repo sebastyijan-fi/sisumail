@@ -159,3 +159,33 @@ func TestMaildirDirStructure(t *testing.T) {
 		}
 	}
 }
+
+func TestMarkReadMovesFromNewToCur(t *testing.T) {
+	dir := t.TempDir()
+	store := &Store{Root: dir}
+
+	id, err := store.Deliver(strings.NewReader("From: a@b\r\n\r\nx\r\n"), "tier1")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Seen {
+		t.Fatalf("expected unread entry, got %+v", entries)
+	}
+
+	if err := store.MarkRead(id); err != nil {
+		t.Fatalf("MarkRead: %v", err)
+	}
+
+	entries, err = store.List()
+	if err != nil {
+		t.Fatalf("List after mark read: %v", err)
+	}
+	if len(entries) != 1 || !entries[0].Seen {
+		t.Fatalf("expected seen entry, got %+v", entries)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sisumail/sisumail/internal/core"
 	"github.com/sisumail/sisumail/internal/proto"
 )
 
@@ -39,3 +40,40 @@ func TestDeliveryMetaBridgeTakeOnce(t *testing.T) {
 	}
 }
 
+func TestTierBadge(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "tier1", want: "Tier1 Blind"},
+		{in: "tier2", want: "Tier2 Spool"},
+		{in: "", want: "Unknown"},
+		{in: "custom", want: "custom"},
+	}
+	for _, tc := range cases {
+		if got := tierBadge(tc.in); got != tc.want {
+			t.Fatalf("tierBadge(%q): got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestApplyInboxFilter(t *testing.T) {
+	entries := []core.MaildirEntry{
+		{ID: "1", Tier: "tier1", Seen: false},
+		{ID: "2", Tier: "tier2", Seen: false},
+		{ID: "3", Tier: "tier1", Seen: true},
+	}
+
+	if got := applyInboxFilter(entries, inboxFilterAll); len(got) != 3 {
+		t.Fatalf("all: got %d, want 3", len(got))
+	}
+	if got := applyInboxFilter(entries, inboxFilterTier1); len(got) != 2 {
+		t.Fatalf("tier1: got %d, want 2", len(got))
+	}
+	if got := applyInboxFilter(entries, inboxFilterTier2); len(got) != 1 {
+		t.Fatalf("tier2: got %d, want 1", len(got))
+	}
+	if got := applyInboxFilter(entries, inboxFilterUnread); len(got) != 2 {
+		t.Fatalf("unread: got %d, want 2", len(got))
+	}
+}

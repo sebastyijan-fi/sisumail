@@ -98,6 +98,7 @@ type MaildirEntry struct {
 	Filename  string
 	Size      int64
 	Tier      string // "tier1" or "tier2"
+	Seen      bool
 	Timestamp time.Time
 }
 
@@ -106,6 +107,7 @@ type MaildirStore interface {
 	Deliver(msg io.Reader, tier string) (id string, err error)
 	List() ([]MaildirEntry, error)
 	Read(id string) (io.ReadCloser, error)
+	MarkRead(id string) error
 }
 
 // ---------------------------------------------------------------------------

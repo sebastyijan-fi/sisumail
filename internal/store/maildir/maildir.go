@@ -109,6 +109,7 @@ func (s *Store) List() ([]core.MaildirEntry, error) {
 			if info != nil {
 				entry.Size = info.Size()
 			}
+			entry.Seen = sub == "cur"
 			entries = append(entries, entry)
 		}
 	}
@@ -123,20 +124,44 @@ func (s *Store) List() ([]core.MaildirEntry, error) {
 
 // Read opens a message file for reading.
 func (s *Store) Read(id string) (io.ReadCloser, error) {
+	p, _, _, err := s.locate(id)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(p)
+}
+
+// MarkRead moves a message from new/ to cur/ if needed.
+func (s *Store) MarkRead(id string) error {
+	p, sub, filename, err := s.locate(id)
+	if err != nil {
+		return err
+	}
+	if sub == "cur" {
+		return nil
+	}
+	dst := filepath.Join(s.Root, "cur", filename)
+	if err := os.Rename(p, dst); err != nil {
+		return fmt.Errorf("mark read: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) locate(id string) (path string, sub string, filename string, err error) {
 	// Search new/ and cur/ for a file matching this ID.
-	for _, sub := range []string{"new", "cur"} {
-		dir := filepath.Join(s.Root, sub)
-		files, err := os.ReadDir(dir)
-		if err != nil {
+	for _, candidate := range []string{"new", "cur"} {
+		dir := filepath.Join(s.Root, candidate)
+		files, readErr := os.ReadDir(dir)
+		if readErr != nil {
 			continue
 		}
 		for _, f := range files {
 			if strings.HasPrefix(f.Name(), id) {
-				return os.Open(filepath.Join(dir, f.Name()))
+				return filepath.Join(dir, f.Name()), candidate, f.Name(), nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("message %s not found", id)
+	return "", "", "", fmt.Errorf("message %s not found", id)
 }
 
 // parseFilename extracts metadata from a Maildir filename.
