@@ -63,6 +63,16 @@ Friction observed:
 2. Command discoverability still depends on first `¤help`
 - Better than before, but we should add guided first-login copy and short examples.
 
+Latest validation pass (same day):
+
+- Hosted shell startup text now explicitly states:
+  - receive-only identity focus
+  - not conversational outbound email
+- Quick chat send now reports explicit delivery mode (`queued-encrypted` vs `delivered-live`) instead of generic `sent`.
+- Verified live on `sisumail.fi`:
+  - sender command returned `queued-encrypted`
+  - recipient `¤chatq` reflected queued encrypted entries with metadata.
+
 ## Priority Fixes (Core-only)
 
 1. `sisumail init` guided onboarding (interactive or non-interactive):
