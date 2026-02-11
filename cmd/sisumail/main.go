@@ -57,6 +57,7 @@ func main() {
 		inboxMode           = flag.Bool("inbox", false, "list local inbox and exit")
 		readID              = flag.String("read-id", "", "read local message by ID and exit")
 		tuiMode             = flag.Bool("tui", false, "interactive local inbox view")
+		shellMode           = flag.Bool("shell", false, "minimal command shell (prefix commands with ¤)")
 		chatTo              = flag.String("chat-to", "", "send encrypted chat message to username (relay session must be online)")
 		chatMsg             = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
 		chatWith            = flag.String("chat-with", "", "interactive chat session with username")
@@ -68,6 +69,9 @@ func main() {
 	flag.Parse()
 	if *tuiMode && strings.TrimSpace(*chatWith) != "" {
 		log.Fatalf("-tui and -chat-with both use stdin; choose one")
+	}
+	if *shellMode && (*tuiMode || strings.TrimSpace(*chatWith) != "") {
+		log.Fatalf("-shell, -tui and -chat-with all use stdin; choose one")
 	}
 
 	store := &maildir.Store{Root: *maildirRoot}
@@ -274,6 +278,12 @@ func main() {
 		if !*tuiMode {
 			cancel()
 		}
+	}
+	if *shellMode {
+		if err := runCommandShell(*user, store, client, chats, known); err != nil {
+			log.Printf("shell failed: %v", err)
+		}
+		cancel()
 	}
 
 	if *tuiMode {
@@ -546,6 +556,138 @@ func runChatREPL(client *ssh.Client, chats *chatlog.Store, known *knownkeys.Stor
 			_ = chats.Append(peer, "out", msg, time.Now())
 		}
 		fmt.Println("sent")
+	}
+}
+
+func runCommandShell(username string, store *maildir.Store, client *ssh.Client, chats *chatlog.Store, known *knownkeys.Store) error {
+	in := bufio.NewReader(os.Stdin)
+	fmt.Printf("Sisumail Shell (%s)\n", username)
+	fmt.Println("Type ¤help for commands. Quick send: ¤<user> <message>")
+	for {
+		fmt.Print("¤ ")
+		line, err := in.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		kind, a, b := parseShellDirective(line)
+		switch kind {
+		case "noop":
+			continue
+		case "quit":
+			return nil
+		case "help":
+			fmt.Println("Commands:")
+			fmt.Println("¤help")
+			fmt.Println("¤whoami")
+			fmt.Println("¤inbox")
+			fmt.Println("¤read <id>")
+			fmt.Println("¤history <user>")
+			fmt.Println("¤quit")
+			fmt.Println("Quick chat send: ¤<user> <message>")
+		case "whoami":
+			fmt.Printf("user=%s relay=connected\n", username)
+		case "inbox":
+			if store == nil {
+				fmt.Println("inbox unavailable")
+				continue
+			}
+			if err := printInbox(store); err != nil {
+				fmt.Printf("inbox failed: %v\n", err)
+			}
+		case "read":
+			if strings.TrimSpace(a) == "" {
+				fmt.Println("usage: ¤read <id>")
+				continue
+			}
+			if store == nil {
+				fmt.Println("mail store unavailable")
+				continue
+			}
+			if err := printMessage(store, a); err != nil {
+				fmt.Printf("read failed: %v\n", err)
+			}
+		case "history":
+			if strings.TrimSpace(a) == "" {
+				fmt.Println("usage: ¤history <user>")
+				continue
+			}
+			if chats == nil {
+				fmt.Println("chat history unavailable")
+				continue
+			}
+			if err := printChatHistory(chats, a, 30); err != nil {
+				fmt.Printf("history failed: %v\n", err)
+			}
+		case "send":
+			peer := strings.TrimSpace(a)
+			msg := strings.TrimSpace(b)
+			if peer == "" || msg == "" {
+				fmt.Println("usage: ¤<user> <message>")
+				continue
+			}
+			if client == nil {
+				fmt.Println("chat unavailable (no relay connection)")
+				continue
+			}
+			if err := sendChat(client, known, peer, msg); err != nil {
+				fmt.Printf("send failed: %v\n", err)
+				continue
+			}
+			if chats != nil {
+				_ = chats.Append(peer, "out", msg, time.Now())
+			}
+			fmt.Println("sent")
+		default:
+			fmt.Println("unknown command. type ¤help")
+		}
+	}
+}
+
+func parseShellDirective(line string) (kind string, arg1 string, arg2 string) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return "noop", "", ""
+	}
+	if strings.HasPrefix(s, "/") {
+		s = "¤" + strings.TrimPrefix(s, "/")
+	}
+	if !strings.HasPrefix(s, "¤") {
+		return "unknown", "", ""
+	}
+	s = strings.TrimSpace(strings.TrimPrefix(s, "¤"))
+	if s == "" {
+		return "noop", "", ""
+	}
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return "noop", "", ""
+	}
+	cmd := strings.ToLower(parts[0])
+	switch cmd {
+	case "q", "quit", "exit":
+		return "quit", "", ""
+	case "help", "h":
+		return "help", "", ""
+	case "whoami", "me":
+		return "whoami", "", ""
+	case "inbox", "i":
+		return "inbox", "", ""
+	case "read", "r":
+		if len(parts) < 2 {
+			return "read", "", ""
+		}
+		return "read", parts[1], ""
+	case "history":
+		if len(parts) < 2 {
+			return "history", "", ""
+		}
+		return "history", parts[1], ""
+	default:
+		if len(parts) < 2 {
+			return "send", cmd, ""
+		}
+		msg := strings.TrimSpace(strings.TrimPrefix(s, parts[0]))
+		return "send", cmd, msg
 	}
 }
 

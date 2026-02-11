@@ -55,6 +55,27 @@ go run ./cmd/sisumail \
   -acme-via-relay=false
 ```
 
+Minimal command shell (chat-first, no heavy TUI):
+
+```bash
+go run ./cmd/sisumail \
+  -relay sisumail.fi:22 \
+  -user niklas \
+  -key ~/.ssh/id_ed25519 \
+  -zone sisumail.fi \
+  -smtp-listen 127.0.0.1:2526 \
+  -tls-policy pragmatic \
+  -shell
+```
+
+Inside shell:
+- `¤help`
+- `¤whoami`
+- `¤inbox`
+- `¤read <id>`
+- `¤history <user>`
+- `¤<user> <message>` to send chat quickly
+
 ### 3) Simulate a sender delivering SMTP to Tier 1
 In a third terminal:
 ```bash

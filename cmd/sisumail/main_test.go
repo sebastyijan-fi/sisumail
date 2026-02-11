@@ -178,3 +178,28 @@ func TestLoadHCloudTokenPrefersPrimaryVar(t *testing.T) {
 		t.Fatalf("loadHCloudToken got %q, want primary", got)
 	}
 }
+
+func TestParseShellDirective(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantKind string
+		wantArg1 string
+		wantArg2 string
+	}{
+		{in: "", wantKind: "noop"},
+		{in: "¤help", wantKind: "help"},
+		{in: "/help", wantKind: "help"},
+		{in: "¤whoami", wantKind: "whoami"},
+		{in: "¤inbox", wantKind: "inbox"},
+		{in: "¤read abc123", wantKind: "read", wantArg1: "abc123"},
+		{in: "¤history niklas", wantKind: "history", wantArg1: "niklas"},
+		{in: "¤niklas hello there", wantKind: "send", wantArg1: "niklas", wantArg2: "hello there"},
+		{in: "plain text", wantKind: "unknown"},
+	}
+	for _, tc := range cases {
+		k, a, b := parseShellDirective(tc.in)
+		if k != tc.wantKind || a != tc.wantArg1 || b != tc.wantArg2 {
+			t.Fatalf("parseShellDirective(%q): got (%q,%q,%q) want (%q,%q,%q)", tc.in, k, a, b, tc.wantKind, tc.wantArg1, tc.wantArg2)
+		}
+	}
+}
