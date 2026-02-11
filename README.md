@@ -80,6 +80,22 @@ go run ./cmd/sisumail \
 
 Note: relay host key verification is enabled by default. For local ephemeral dev relays, pass `-insecure-host-key`.
 
+Zero-flag local flow (after one-time init):
+
+```bash
+sisumail -init \
+  -relay sisumail.fi:22 \
+  -user <username> \
+  -key ~/.ssh/id_ed25519 \
+  -zone sisumail.fi \
+  -shell
+
+# daily use
+sisumail
+```
+
+Config path default: `~/.config/sisumail/config.env` (override with `-config`).
+
 Minimal command shell (chat-first, no heavy TUI):
 
 ```bash

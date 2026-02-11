@@ -26,6 +26,7 @@ Scope: real usage on live node `37.27.19.170` as end users (SSH login, ACME boot
 3. No single command for “create identity + run node”
 - Current path works, but there is no guided first-run workflow.
 - Strong candidate for a `sisumail init` command.
+- Update: `sisumail -init` now writes core defaults to `~/.config/sisumail/config.env` so daily local usage can be near zero-flag.
 
 4. Manual operator/live verification is still ad hoc
 - We had live checks, but needed one script to standardize this.

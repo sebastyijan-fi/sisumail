@@ -37,6 +37,8 @@ import (
 
 func main() {
 	var (
+		configPath          = flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "sisumail", "config.env"), "config file path for default flags")
+		initConfig          = flag.Bool("init", false, "write current core settings to -config and exit")
 		relayAddr           = flag.String("relay", "127.0.0.1:2222", "relay SSH address (dev default 127.0.0.1:2222)")
 		user                = flag.String("user", "niklas", "sisumail username")
 		zone                = flag.String("zone", "sisumail.fi", "root zone name")
@@ -70,6 +72,47 @@ func main() {
 		chatLimit           = flag.Int("chat-limit", 100, "max chat history lines for -chat-history (0 = unlimited)")
 	)
 	flag.Parse()
+	explicit := visitedFlags()
+	if err := applyConfigOverrides(*configPath, explicit, map[string]configField{
+		"relay":             {FlagName: "relay", Set: setString(relayAddr)},
+		"user":              {FlagName: "user", Set: setString(user)},
+		"zone":              {FlagName: "zone", Set: setString(zone)},
+		"key":               {FlagName: "key", Set: setString(keyPath)},
+		"known-hosts":       {FlagName: "known-hosts", Set: setString(knownHostsPath)},
+		"insecure-host-key": {FlagName: "insecure-host-key", Set: setBool(insecureHostKey)},
+		"smtp-listen":       {FlagName: "smtp-listen", Set: setString(smtpListen)},
+		"tls-policy":        {FlagName: "tls-policy", Set: setString(tlsPolicy)},
+		"acme-dns01":        {FlagName: "acme-dns01", Set: setBool(acmeDNS01Enabled)},
+		"acme-via-relay":    {FlagName: "acme-via-relay", Set: setBool(acmeViaRelay)},
+		"shell":             {FlagName: "shell", Set: setBool(shellMode)},
+		"maildir":           {FlagName: "maildir", Set: setString(maildirRoot)},
+		"chat-dir":          {FlagName: "chat-dir", Set: setString(chatDir)},
+		"known-keys":        {FlagName: "known-keys", Set: setString(knownKeysPath)},
+	}); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if *initConfig {
+		if err := writeCoreConfig(*configPath, coreConfigValues{
+			Relay:           strings.TrimSpace(*relayAddr),
+			User:            strings.TrimSpace(*user),
+			Zone:            strings.TrimSpace(*zone),
+			Key:             strings.TrimSpace(*keyPath),
+			KnownHosts:      strings.TrimSpace(*knownHostsPath),
+			InsecureHostKey: *insecureHostKey,
+			SMTPListen:      strings.TrimSpace(*smtpListen),
+			TLSPolicy:       strings.TrimSpace(*tlsPolicy),
+			ACMEDNS01:       *acmeDNS01Enabled,
+			ACMEViaRelay:    *acmeViaRelay,
+			Shell:           *shellMode,
+			Maildir:         strings.TrimSpace(*maildirRoot),
+			ChatDir:         strings.TrimSpace(*chatDir),
+			KnownKeys:       strings.TrimSpace(*knownKeysPath),
+		}); err != nil {
+			log.Fatalf("write config: %v", err)
+		}
+		log.Printf("wrote config: %s", *configPath)
+		return
+	}
 	if *tuiMode && strings.TrimSpace(*chatWith) != "" {
 		log.Fatalf("-tui and -chat-with both use stdin; choose one")
 	}
@@ -444,6 +487,139 @@ func buildHostKeyCallback(insecure bool, knownHostsPath string) (ssh.HostKeyCall
 		return nil, err
 	}
 	return cb, nil
+}
+
+type configField struct {
+	FlagName string
+	Set      func(string) error
+}
+
+type coreConfigValues struct {
+	Relay           string
+	User            string
+	Zone            string
+	Key             string
+	KnownHosts      string
+	InsecureHostKey bool
+	SMTPListen      string
+	TLSPolicy       string
+	ACMEDNS01       bool
+	ACMEViaRelay    bool
+	Shell           bool
+	Maildir         string
+	ChatDir         string
+	KnownKeys       string
+}
+
+func visitedFlags() map[string]bool {
+	out := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		out[strings.TrimSpace(f.Name)] = true
+	})
+	return out
+}
+
+func setString(dst *string) func(string) error {
+	return func(v string) error {
+		*dst = strings.TrimSpace(v)
+		return nil
+	}
+}
+
+func setBool(dst *bool) func(string) error {
+	return func(v string) error {
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return err
+		}
+		*dst = b
+		return nil
+	}
+}
+
+func applyConfigOverrides(path string, explicit map[string]bool, fields map[string]configField) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	values, err := readConfigFile(path)
+	if err != nil {
+		return err
+	}
+	for key, raw := range values {
+		field, ok := fields[key]
+		if !ok {
+			continue
+		}
+		if explicit[field.FlagName] {
+			continue
+		}
+		if err := field.Set(raw); err != nil {
+			return fmt.Errorf("parse %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func readConfigFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	out := make(map[string]string)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		out[k] = strings.TrimSpace(v)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func writeCoreConfig(path string, cfg coreConfigValues) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("empty config path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	content := strings.Join([]string{
+		"# sisumail core defaults",
+		"relay=" + cfg.Relay,
+		"user=" + cfg.User,
+		"zone=" + cfg.Zone,
+		"key=" + cfg.Key,
+		"known-hosts=" + cfg.KnownHosts,
+		"insecure-host-key=" + strconv.FormatBool(cfg.InsecureHostKey),
+		"smtp-listen=" + cfg.SMTPListen,
+		"tls-policy=" + cfg.TLSPolicy,
+		"acme-dns01=" + strconv.FormatBool(cfg.ACMEDNS01),
+		"acme-via-relay=" + strconv.FormatBool(cfg.ACMEViaRelay),
+		"shell=" + strconv.FormatBool(cfg.Shell),
+		"maildir=" + cfg.Maildir,
+		"chat-dir=" + cfg.ChatDir,
+		"known-keys=" + cfg.KnownKeys,
+		"",
+	}, "\n")
+	return os.WriteFile(path, []byte(content), 0600)
 }
 
 func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Store) {

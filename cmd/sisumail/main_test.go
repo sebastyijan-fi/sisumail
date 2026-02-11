@@ -2,6 +2,8 @@ package main
 
 import (
 	"net/mail"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -218,5 +220,53 @@ func TestBuildHostKeyCallbackMissingFile(t *testing.T) {
 	_, err := buildHostKeyCallback(false, "/nonexistent/known_hosts")
 	if err == nil {
 		t.Fatal("expected error for missing known_hosts")
+	}
+}
+
+func TestApplyConfigOverrides(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.env")
+	err := os.WriteFile(cfgPath, []byte("user=fromcfg\nshell=true\n"), 0600)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	user := "default"
+	shell := false
+	explicit := map[string]bool{"shell": true}
+	err = applyConfigOverrides(cfgPath, explicit, map[string]configField{
+		"user":  {FlagName: "user", Set: setString(&user)},
+		"shell": {FlagName: "shell", Set: setBool(&shell)},
+	})
+	if err != nil {
+		t.Fatalf("applyConfigOverrides: %v", err)
+	}
+	if user != "fromcfg" {
+		t.Fatalf("user override: got %q want fromcfg", user)
+	}
+	if shell {
+		t.Fatal("shell should not be overridden when explicit flag is set")
+	}
+}
+
+func TestWriteCoreConfigAndRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sisumail", "config.env")
+	err := writeCoreConfig(path, coreConfigValues{
+		Relay:      "sisumail.fi:22",
+		User:       "niklas",
+		Zone:       "sisumail.fi",
+		Key:        "/home/me/.ssh/id_ed25519",
+		KnownHosts: "/home/me/.ssh/known_hosts",
+	})
+	if err != nil {
+		t.Fatalf("writeCoreConfig: %v", err)
+	}
+	values, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile: %v", err)
+	}
+	if values["relay"] != "sisumail.fi:22" || values["user"] != "niklas" {
+		t.Fatalf("unexpected config values: %#v", values)
 	}
 }
