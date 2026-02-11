@@ -14,3 +14,18 @@ jobs:
       - name: Test
         run: |
           go test ./...
+
+  smoke-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Local Smoke Scripts
+        run: |
+          set -euo pipefail
+          scripts/smoke_chat_relay.sh
+          scripts/smoke_chat_offline_queue.sh
+          scripts/smoke_spool_on_connect.sh
+          scripts/smoke_spool_realtime.sh
