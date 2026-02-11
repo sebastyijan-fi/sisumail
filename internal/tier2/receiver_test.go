@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gosmtp "github.com/emersion/go-smtp"
 )
 
 type staticResolver struct {
@@ -81,5 +83,35 @@ func TestReceiverEncryptsAndSpools(t *testing.T) {
 	}
 	if out.String() != plaintext {
 		t.Fatalf("plaintext mismatch:\n  got:  %q\n  want: %q", out.String(), plaintext)
+	}
+}
+
+func TestReceiverRequiresTLS(t *testing.T) {
+	pub, _ := genTestKeyPair(t)
+
+	rcv := &Receiver{
+		KeyResolver: &staticResolver{domain: "niklas.sisumail.fi", key: pub},
+		Spool:       &FileSpool{Root: t.TempDir()},
+		Domain:      "sisumail.fi",
+		RequireTLS:  true,
+	}
+
+	sessAny, err := rcv.NewSession(nil)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sess := sessAny.(*session)
+
+	err = sess.Mail("sender@example.com", nil)
+	if err == nil {
+		t.Fatal("expected TLS-required error")
+	}
+
+	smtpErr, ok := err.(*gosmtp.SMTPError)
+	if !ok {
+		t.Fatalf("expected SMTPError, got %T", err)
+	}
+	if smtpErr.Code != 530 {
+		t.Fatalf("expected SMTP 530, got %d", smtpErr.Code)
 	}
 }

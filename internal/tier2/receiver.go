@@ -23,18 +23,39 @@ type Receiver struct {
 	Spool       core.SpoolStore
 	Domain      string // e.g. "sisumail.fi"
 	MaxSize     int64  // max message size in bytes (0 = no limit)
+	RequireTLS  bool   // require STARTTLS before MAIL/RCPT/DATA
 }
 
 // NewSession implements smtp.Backend.
 func (r *Receiver) NewSession(conn *gosmtp.Conn) (gosmtp.Session, error) {
-	return &session{receiver: r}, nil
+	return &session{receiver: r, conn: conn}, nil
 }
 
 type session struct {
 	receiver  *Receiver
+	conn      *gosmtp.Conn
 	from      string
 	recipient string // the first RCPT TO domain
 	pubKey    string
+}
+
+func (s *session) tlsActive() bool {
+	if s.conn == nil {
+		return false
+	}
+	_, ok := s.conn.TLSConnectionState()
+	return ok
+}
+
+func (s *session) requireTLS() error {
+	if !s.receiver.RequireTLS || s.tlsActive() {
+		return nil
+	}
+	return &gosmtp.SMTPError{
+		Code:         530,
+		EnhancedCode: gosmtp.EnhancedCode{5, 7, 0},
+		Message:      "Must issue STARTTLS first",
+	}
 }
 
 func (s *session) AuthPlain(username, password string) error {
@@ -42,11 +63,18 @@ func (s *session) AuthPlain(username, password string) error {
 }
 
 func (s *session) Mail(from string, opts *gosmtp.MailOptions) error {
+	if err := s.requireTLS(); err != nil {
+		return err
+	}
 	s.from = from
 	return nil
 }
 
 func (s *session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
+	if err := s.requireTLS(); err != nil {
+		return err
+	}
+
 	// Extract domain from RCPT TO for key lookup.
 	parts := strings.SplitN(to, "@", 2)
 	if len(parts) != 2 {
@@ -93,6 +121,10 @@ func (s *session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 }
 
 func (s *session) Data(r io.Reader) error {
+	if err := s.requireTLS(); err != nil {
+		return err
+	}
+
 	if s.pubKey == "" {
 		return &gosmtp.SMTPError{
 			Code:         503,

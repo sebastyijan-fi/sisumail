@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,11 +28,17 @@ func main() {
 		maxBytes = flag.Int64("max-bytes", 25<<20, "max message size in bytes (0 = unlimited)")
 		certPath = flag.String("tls-cert", "", "TLS cert PEM for STARTTLS (recommended for real MX)")
 		keyPath  = flag.String("tls-key", "", "TLS key PEM for STARTTLS (recommended for real MX)")
+		tlsMode  = flag.String("tls-mode", "opportunistic", "TLS mode: disable|opportunistic|required")
 	)
 	flag.Parse()
 
 	if *zone == "" {
 		log.Fatalf("missing -zone (e.g. sisumail.fi)")
+	}
+
+	mode, err := parseTLSMode(*tlsMode)
+	if err != nil {
+		log.Fatalf("invalid -tls-mode: %v", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,6 +66,7 @@ func main() {
 		Spool:       spool,
 		Domain:      *zone,
 		MaxSize:     *maxBytes,
+		RequireTLS:  mode == tlsModeRequired,
 	}
 
 	srv := smtp.NewServer(backend)
@@ -70,15 +79,31 @@ func main() {
 	srv.MaxMessageBytes = *maxBytes
 	srv.MaxRecipients = 50
 
-	if *certPath != "" && *keyPath != "" {
+	hasCert := *certPath != "" || *keyPath != ""
+	if hasCert && (*certPath == "" || *keyPath == "") {
+		log.Fatalf("both -tls-cert and -tls-key must be provided")
+	}
+	if mode == tlsModeRequired && !hasCert {
+		log.Fatalf("tls mode 'required' needs -tls-cert and -tls-key")
+	}
+
+	if hasCert {
 		cert, err := tls.LoadX509KeyPair(*certPath, *keyPath)
 		if err != nil {
 			log.Fatalf("load tls cert: %v", err)
 		}
-		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-		log.Printf("tier2: STARTTLS enabled (cert=%s key=%s)", *certPath, *keyPath)
+		srv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		log.Printf("tier2: STARTTLS enabled (mode=%s cert=%s key=%s)", mode, *certPath, *keyPath)
 	} else {
-		log.Printf("tier2: STARTTLS disabled (no -tls-cert/-tls-key provided)")
+		switch mode {
+		case tlsModeDisable:
+			log.Printf("tier2: STARTTLS disabled (mode=%s)", mode)
+		case tlsModeOpportunistic:
+			log.Printf("tier2: STARTTLS disabled (no -tls-cert/-tls-key provided, mode=%s)", mode)
+		}
 	}
 
 	go func() {
@@ -93,3 +118,23 @@ func main() {
 	_ = srv.Close()
 }
 
+type tlsModeKind string
+
+const (
+	tlsModeDisable       tlsModeKind = "disable"
+	tlsModeOpportunistic tlsModeKind = "opportunistic"
+	tlsModeRequired      tlsModeKind = "required"
+)
+
+func parseTLSMode(s string) (tlsModeKind, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case string(tlsModeDisable):
+		return tlsModeDisable, nil
+	case string(tlsModeOpportunistic):
+		return tlsModeOpportunistic, nil
+	case string(tlsModeRequired):
+		return tlsModeRequired, nil
+	default:
+		return "", errors.New("expected disable|opportunistic|required")
+	}
+}
