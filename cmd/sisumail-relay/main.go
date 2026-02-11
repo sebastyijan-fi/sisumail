@@ -362,8 +362,16 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					if err != nil {
 						return
 					}
-					go ssh.DiscardRequests(reqs)
+					go func() {
+						for req := range reqs {
+							// Best-effort compatibility for clients expecting shell/pty ack.
+							if req.WantReply {
+								_ = req.Reply(true, nil)
+							}
+						}
+					}()
 					_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
+					_, _ = c.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: 0}))
 					_ = c.Close()
 				case "key-lookup":
 					handleKeyLookupChannel(ch, store, source, chatGuard, stats)

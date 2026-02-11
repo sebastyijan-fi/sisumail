@@ -31,6 +31,19 @@ Scope: real usage on live node `37.27.19.170` as end users (SSH login, ACME boot
 - We had live checks, but needed one script to standardize this.
 - Added live script: `scripts/smoke_acme_relay_live.sh`.
 
+## Outside-In Check (Local -> sisumail.fi)
+
+Validated from a separate local machine perspective after port migration (`product SSH :22`, `admin SSH :22222`):
+
+- `ssh <user>@sisumail.fi` reaches Sisumail gateway successfully.
+- Strict ACME bootstrap via relay completed in ~43s in staging.
+- Chat online/offline/reconnect worked from local client to live relay.
+
+Follow-up fix applied:
+- Session channel now sends explicit SSH `exit-status=0` and acked session requests.
+- Before fix: plain SSH often ended with exit code `255` despite successful banner.
+- After fix: plain SSH returns exit code `0`.
+
 ## Priority Fixes (Core-only)
 
 1. `sisumail init` guided onboarding (interactive or non-interactive):
