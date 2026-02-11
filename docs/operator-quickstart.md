@@ -208,6 +208,16 @@ Relay ACME control channel:
 - When `HCLOUD_TOKEN`, `SISUMAIL_DNS_ZONE`, and `SISUMAIL_IPV6_PREFIX` are configured, the relay also enables authenticated `acme-dns01` control for connected users.
 - Nodes can run `sisumail -acme-dns01` without local DNS API tokens (default behavior uses relay channel).
 
+Live ACME relay smoke test (staging CA by default):
+
+```bash
+scripts/smoke_acme_relay_live.sh
+```
+
+Optional overrides:
+- `ACME_DIR` (default Let’s Encrypt staging)
+- `RELAY_ADDR`, `SMTP_LISTEN`, `ZONE`, `PROP_WAIT`, `TIMEOUT_SECS`
+
 ## 10) Production Cutover (Later)
 
 Do not do this until Tier 2 + hardening are ready.
