@@ -189,3 +189,40 @@ func TestMarkReadMovesFromNewToCur(t *testing.T) {
 		t.Fatalf("expected seen entry, got %+v", entries)
 	}
 }
+
+func TestDeleteRemovesMessage(t *testing.T) {
+	dir := t.TempDir()
+	store := &Store{Root: dir}
+
+	id, err := store.Deliver(strings.NewReader("From: a@b\r\n\r\nx\r\n"), "tier1")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if err := store.Delete(id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := store.Read(id); err == nil {
+		t.Fatal("expected deleted message to be unreadable")
+	}
+}
+
+func TestArchiveMovesOutOfInbox(t *testing.T) {
+	dir := t.TempDir()
+	store := &Store{Root: dir}
+
+	id, err := store.Deliver(strings.NewReader("From: a@b\r\n\r\nx\r\n"), "tier1")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if err := store.Archive(id); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 inbox entries after archive, got %d", len(entries))
+	}
+}

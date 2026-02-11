@@ -147,6 +147,35 @@ func (s *Store) MarkRead(id string) error {
 	return nil
 }
 
+// Delete removes a message from new/ or cur/.
+func (s *Store) Delete(id string) error {
+	p, _, _, err := s.locate(id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	return nil
+}
+
+// Archive moves a message from new/ or cur/ into archive/.
+func (s *Store) Archive(id string) error {
+	if err := os.MkdirAll(filepath.Join(s.Root, "archive"), 0700); err != nil {
+		return fmt.Errorf("archive mkdir: %w", err)
+	}
+
+	p, _, filename, err := s.locate(id)
+	if err != nil {
+		return err
+	}
+	dst := filepath.Join(s.Root, "archive", filename)
+	if err := os.Rename(p, dst); err != nil {
+		return fmt.Errorf("archive: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) locate(id string) (path string, sub string, filename string, err error) {
 	// Search new/ and cur/ for a file matching this ID.
 	for _, candidate := range []string{"new", "cur"} {

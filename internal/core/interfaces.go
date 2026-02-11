@@ -108,6 +108,8 @@ type MaildirStore interface {
 	List() ([]MaildirEntry, error)
 	Read(id string) (io.ReadCloser, error)
 	MarkRead(id string) error
+	Delete(id string) error
+	Archive(id string) error
 }
 
 // ---------------------------------------------------------------------------

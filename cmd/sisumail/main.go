@@ -472,7 +472,7 @@ func runInboxTUI(store *maildir.Store) error {
 			}
 		}
 		fmt.Println()
-		fmt.Print("Command [number=open, m <n>=mark-read, a|1|2|u filter, r refresh, q quit]: ")
+		fmt.Print("Command [number=open, m <n>=mark-read, d <n>=delete, x <n>=archive, a|1|2|u filter, r refresh, q quit]: ")
 
 		line, err := in.ReadString('\n')
 		if err != nil {
@@ -506,6 +506,28 @@ func runInboxTUI(store *maildir.Store) error {
 			}
 			if err := store.MarkRead(view[n-1].ID); err != nil {
 				fmt.Printf("mark-read failed: %v\n", err)
+			}
+			continue
+		}
+		if strings.HasPrefix(cmd, "d ") {
+			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "d ")))
+			if err != nil || n < 1 || n > len(view) {
+				fmt.Println("invalid selection")
+				continue
+			}
+			if err := store.Delete(view[n-1].ID); err != nil {
+				fmt.Printf("delete failed: %v\n", err)
+			}
+			continue
+		}
+		if strings.HasPrefix(cmd, "x ") {
+			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "x ")))
+			if err != nil || n < 1 || n > len(view) {
+				fmt.Println("invalid selection")
+				continue
+			}
+			if err := store.Archive(view[n-1].ID); err != nil {
+				fmt.Printf("archive failed: %v\n", err)
 			}
 			continue
 		}
