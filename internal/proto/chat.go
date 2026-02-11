@@ -16,6 +16,7 @@ type ChatSendHeader struct {
 
 type ChatDeliveryHeader struct {
 	From      string
+	MessageID string
 	SizeBytes int64
 }
 
@@ -45,10 +46,10 @@ func ReadChatSendHeader(r io.Reader) (ChatSendHeader, *bufio.Reader, error) {
 }
 
 func WriteChatDeliveryHeader(w io.Writer, h ChatDeliveryHeader) error {
-	if strings.TrimSpace(h.From) == "" || h.SizeBytes < 0 {
+	if strings.TrimSpace(h.From) == "" || strings.TrimSpace(h.MessageID) == "" || h.SizeBytes < 0 {
 		return fmt.Errorf("invalid chat delivery header")
 	}
-	_, err := fmt.Fprintf(w, "CHAT1 DELIVER %s %d\n", h.From, h.SizeBytes)
+	_, err := fmt.Fprintf(w, "CHAT1 DELIVER %s %s %d\n", h.From, h.MessageID, h.SizeBytes)
 	return err
 }
 
@@ -59,14 +60,39 @@ func ReadChatDeliveryHeader(r io.Reader) (ChatDeliveryHeader, *bufio.Reader, err
 		return ChatDeliveryHeader{}, br, err
 	}
 	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) != 4 || parts[0] != "CHAT1" || parts[1] != "DELIVER" {
+	if len(parts) != 5 || parts[0] != "CHAT1" || parts[1] != "DELIVER" {
 		return ChatDeliveryHeader{}, br, fmt.Errorf("invalid chat delivery header")
 	}
-	n, err := strconv.ParseInt(parts[3], 10, 64)
+	n, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil || n < 0 {
 		return ChatDeliveryHeader{}, br, fmt.Errorf("invalid chat delivery size")
 	}
-	return ChatDeliveryHeader{From: parts[2], SizeBytes: n}, br, nil
+	return ChatDeliveryHeader{From: parts[2], MessageID: parts[3], SizeBytes: n}, br, nil
+}
+
+func WriteChatAck(w io.Writer, messageID string) error {
+	id := strings.TrimSpace(messageID)
+	if id == "" {
+		return fmt.Errorf("empty message id")
+	}
+	_, err := fmt.Fprintf(w, "CHAT1 ACK %s\n", id)
+	return err
+}
+
+func ReadChatAck(r io.Reader, wantMessageID string) error {
+	br := bufio.NewReader(r)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) != 3 || parts[0] != "CHAT1" || parts[1] != "ACK" {
+		return fmt.Errorf("invalid chat ack")
+	}
+	if parts[2] != strings.TrimSpace(wantMessageID) {
+		return fmt.Errorf("chat ack mismatch")
+	}
+	return nil
 }
 
 func WriteKeyLookupRequest(w io.Writer, username string) error {
@@ -121,4 +147,3 @@ func ReadKeyLookupResponse(r io.Reader) (string, error) {
 	}
 	return string(raw), nil
 }
-

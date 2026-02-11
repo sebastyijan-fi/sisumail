@@ -26,6 +26,7 @@ import (
 	"github.com/sisumail/sisumail/internal/provision"
 	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/relay"
+	"github.com/sisumail/sisumail/internal/store/chatqueue"
 	"github.com/sisumail/sisumail/internal/tier2"
 	"golang.org/x/crypto/ssh"
 )
@@ -49,6 +50,7 @@ func main() {
 		ipv6Str     = flag.String("ipv6", "", "IPv6 address for -add-user")
 		allowClaim  = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
 		spoolDir    = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
+		chatSpoolDir = flag.String("chat-spool-dir", "/var/spool/sisumail/chat", "encrypted chat queue root (for offline delivery)")
 	)
 	flag.Parse()
 
@@ -157,10 +159,11 @@ func main() {
 	serverCfg.AddHostKey(hostKey)
 
 	spool := &tier2.FileSpool{Root: *spoolDir}
+	chatSpool := &chatqueue.Store{Root: *chatSpoolDir}
 	spoolPump := newSpoolDeliveryPump()
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, spoolPump); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, spoolPump); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -231,7 +234,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, pump *spoolDeliveryPump) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -255,11 +258,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, store, reg, spool, pump)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, pump)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, pump *spoolDeliveryPump) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -284,6 +287,9 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	// This keeps the "spool on reconnect" promise without requiring polling.
 	if spool != nil && pump != nil {
 		go deliverPendingSpool(ctx, sshConn, user, spool, pump, true)
+	}
+	if chatSpool != nil {
+		go deliverPendingChat(ctx, sshConn, user, chatSpool, true)
 	}
 
 	// Ignore global requests.
@@ -311,7 +317,7 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 				case "key-lookup":
 					handleKeyLookupChannel(ch, store)
 				case "chat-send":
-					handleChatSendChannel(ch, user, reg)
+					handleChatSendChannel(ch, user, reg, chatSpool)
 				default:
 					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
 					return
@@ -345,7 +351,7 @@ func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store) {
 	_ = proto.WriteKeyLookupResponse(c, id.PubKeyText)
 }
 
-func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionRegistry) {
+func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionRegistry, chatSpool *chatqueue.Store) {
 	c, reqs, err := ch.Accept()
 	if err != nil {
 		return
@@ -357,26 +363,102 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionR
 	if err != nil {
 		return
 	}
-	if reg == nil {
+	if reg == nil || strings.TrimSpace(h.To) == "" || h.SizeBytes < 0 {
 		return
 	}
 	dst, ok := reg.GetSession(h.To)
 	if !ok || dst == nil || dst.Conn == nil {
+		// Recipient offline: queue encrypted payload for later delivery.
+		if chatSpool != nil {
+			id := fmt.Sprintf("%d", time.Now().UnixNano())
+			meta := chatqueue.Meta{
+				ID:         id,
+				From:       sender,
+				To:         h.To,
+				ReceivedAt: time.Now(),
+			}
+			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
+		}
 		return
 	}
 
 	out, outReqs, err := dst.Conn.OpenChannel("chat-delivery", nil)
 	if err != nil {
+		// Best effort fallback to queue when live open fails.
+		if chatSpool != nil {
+			id := fmt.Sprintf("%d", time.Now().UnixNano())
+			meta := chatqueue.Meta{
+				ID:         id,
+				From:       sender,
+				To:         h.To,
+				ReceivedAt: time.Now(),
+			}
+			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
+		}
 		return
 	}
 	go ssh.DiscardRequests(outReqs)
 	defer out.Close()
 
-	dh := proto.ChatDeliveryHeader{From: sender, SizeBytes: h.SizeBytes}
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	dh := proto.ChatDeliveryHeader{From: sender, MessageID: id, SizeBytes: h.SizeBytes}
 	if err := proto.WriteChatDeliveryHeader(out, dh); err != nil {
 		return
 	}
 	_, _ = io.CopyN(out, br, h.SizeBytes)
+}
+
+func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool) {
+	if chOpen == nil || q == nil || strings.TrimSpace(user) == "" {
+		return
+	}
+	list, err := q.List(user)
+	if err != nil || len(list) == 0 {
+		return
+	}
+	if initialDelay {
+		time.Sleep(150 * time.Millisecond)
+	}
+	for _, meta := range list {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		rc, got, err := q.Get(user, meta.ID)
+		if err != nil {
+			continue
+		}
+		ch, reqs, err := chOpen.OpenChannel("chat-delivery", nil)
+		if err != nil {
+			_ = rc.Close()
+			continue
+		}
+		go ssh.DiscardRequests(reqs)
+		h := proto.ChatDeliveryHeader{From: got.From, MessageID: got.ID, SizeBytes: got.SizeBytes}
+		if err := proto.WriteChatDeliveryHeader(ch, h); err != nil {
+			_ = rc.Close()
+			_ = ch.Close()
+			continue
+		}
+		_, err = io.Copy(ch, rc)
+		_ = rc.Close()
+		if err != nil {
+			_ = ch.Close()
+			continue
+		}
+		ackCh := make(chan error, 1)
+		go func() { ackCh <- proto.ReadChatAck(ch, got.ID) }()
+		select {
+		case err := <-ackCh:
+			if err == nil {
+				_ = q.Ack(user, meta.ID)
+			}
+		case <-time.After(3 * time.Second):
+			// Keep queued entry for retry on next reconnect.
+		}
+		_ = ch.Close()
+	}
 }
 
 func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {

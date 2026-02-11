@@ -21,15 +21,25 @@ func TestChatSendHeaderRoundTrip(t *testing.T) {
 
 func TestChatDeliveryHeaderRoundTrip(t *testing.T) {
 	var b bytes.Buffer
-	if err := WriteChatDeliveryHeader(&b, ChatDeliveryHeader{From: "bob", SizeBytes: 99}); err != nil {
+	if err := WriteChatDeliveryHeader(&b, ChatDeliveryHeader{From: "bob", MessageID: "m1", SizeBytes: 99}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	h, _, err := ReadChatDeliveryHeader(&b)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if h.From != "bob" || h.SizeBytes != 99 {
+	if h.From != "bob" || h.MessageID != "m1" || h.SizeBytes != 99 {
 		t.Fatalf("unexpected header: %+v", h)
+	}
+}
+
+func TestChatAckRoundTrip(t *testing.T) {
+	var b bytes.Buffer
+	if err := WriteChatAck(&b, "m-ack"); err != nil {
+		t.Fatalf("write ack: %v", err)
+	}
+	if err := ReadChatAck(&b, "m-ack"); err != nil {
+		t.Fatalf("read ack: %v", err)
 	}
 }
 
@@ -59,4 +69,3 @@ func TestKeyLookupRoundTrip(t *testing.T) {
 		t.Fatalf("pubkey mismatch")
 	}
 }
-

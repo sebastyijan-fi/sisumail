@@ -22,6 +22,7 @@ import (
 
 	"github.com/emersion/go-smtp"
 	"github.com/sisumail/sisumail/internal/core"
+	"github.com/sisumail/sisumail/internal/store/chatlog"
 	"github.com/sisumail/sisumail/internal/store/maildir"
 	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/tier2"
@@ -44,12 +45,23 @@ func main() {
 		tuiMode    = flag.Bool("tui", false, "interactive local inbox view")
 		chatTo     = flag.String("chat-to", "", "send encrypted chat message to username (relay session must be online)")
 		chatMsg    = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
+		chatWith   = flag.String("chat-with", "", "interactive chat session with username")
+		chatDir    = flag.String("chat-dir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "chat"), "local chat history directory")
+		chatHistory = flag.String("chat-history", "", "print chat history with username and exit")
+		chatLimit  = flag.Int("chat-limit", 100, "max chat history lines for -chat-history (0 = unlimited)")
 	)
 	flag.Parse()
+	if *tuiMode && strings.TrimSpace(*chatWith) != "" {
+		log.Fatalf("-tui and -chat-with both use stdin; choose one")
+	}
 
 	store := &maildir.Store{Root: *maildirRoot}
 	if err := store.Init(); err != nil {
 		log.Fatalf("maildir init: %v", err)
+	}
+	chats := &chatlog.Store{Root: *chatDir}
+	if err := chats.Init(); err != nil {
+		log.Fatalf("chatlog init: %v", err)
 	}
 
 	if *inboxMode {
@@ -61,6 +73,12 @@ func main() {
 	if *readID != "" {
 		if err := printMessage(store, *readID); err != nil {
 			log.Fatalf("read-id: %v", err)
+		}
+		return
+	}
+	if strings.TrimSpace(*chatHistory) != "" {
+		if err := printChatHistory(chats, *chatHistory, *chatLimit); err != nil {
+			log.Fatalf("chat-history: %v", err)
 		}
 		return
 	}
@@ -160,7 +178,7 @@ func main() {
 	go func() {
 		chans := client.HandleChannelOpen("chat-delivery")
 		for ch := range chans {
-			go handleChatDeliveryChannel(ch, string(sshKey))
+			go handleChatDeliveryChannel(ch, string(sshKey), chats)
 		}
 	}()
 
@@ -171,7 +189,16 @@ func main() {
 		if err := sendChat(client, *chatTo, *chatMsg); err != nil {
 			log.Printf("chat send failed: %v", err)
 		} else {
+			_ = chats.Append(*chatTo, "out", strings.TrimSpace(*chatMsg), time.Now())
 			log.Printf("chat sent: from=%s to=%s", *user, *chatTo)
+		}
+		if !*tuiMode {
+			cancel()
+		}
+	}
+	if strings.TrimSpace(*chatWith) != "" {
+		if err := runChatREPL(client, chats, *chatWith); err != nil {
+			log.Printf("chat session failed: %v", err)
 		}
 		if !*tuiMode {
 			cancel()
@@ -266,7 +293,7 @@ func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Sto
 	_ = proto.WriteSpoolAck(channel, h.MessageID)
 }
 
-func handleChatDeliveryChannel(ch ssh.NewChannel, sshPrivKey string) {
+func handleChatDeliveryChannel(ch ssh.NewChannel, sshPrivKey string, chats *chatlog.Store) {
 	if ch.ChannelType() != "chat-delivery" {
 		_ = ch.Reject(ssh.UnknownChannelType, "unsupported channel")
 		return
@@ -288,7 +315,12 @@ func handleChatDeliveryChannel(ch ssh.NewChannel, sshPrivKey string) {
 		log.Printf("chat-delivery: decrypt failed from=%s err=%v", h.From, err)
 		return
 	}
-	log.Printf("chat-delivery: from=%s msg=%q", h.From, strings.TrimSpace(plain.String()))
+	msg := strings.TrimSpace(plain.String())
+	log.Printf("chat-delivery: from=%s msg=%q", h.From, msg)
+	if chats != nil {
+		_ = chats.Append(h.From, "in", msg, time.Now())
+	}
+	_ = proto.WriteChatAck(channel, h.MessageID)
 }
 
 func sendChat(client *ssh.Client, toUser, message string) error {
@@ -316,6 +348,44 @@ func sendChat(client *ssh.Client, toUser, message string) error {
 	}
 	_, err = io.Copy(ch, &ct)
 	return err
+}
+
+func runChatREPL(client *ssh.Client, chats *chatlog.Store, peer string) error {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return fmt.Errorf("empty peer")
+	}
+
+	fmt.Printf("Chat session with %s\n", peer)
+	fmt.Println("Type messages and press Enter. Commands: /quit, /history")
+	in := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Print("> ")
+		line, err := in.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		msg := strings.TrimSpace(line)
+		switch msg {
+		case "":
+			continue
+		case "/quit":
+			return nil
+		case "/history":
+			_ = printChatHistory(chats, peer, 20)
+			continue
+		}
+
+		if err := sendChat(client, peer, msg); err != nil {
+			fmt.Printf("send failed: %v\n", err)
+			continue
+		}
+		if chats != nil {
+			_ = chats.Append(peer, "out", msg, time.Now())
+		}
+		fmt.Println("sent")
+	}
 }
 
 func lookupUserPubKey(client *ssh.Client, username string) (string, error) {
@@ -507,6 +577,25 @@ func printMessage(store *maildir.Store, id string) error {
 		return err
 	}
 	_, _ = os.Stdout.Write(data)
+	return nil
+}
+
+func printChatHistory(chats *chatlog.Store, peer string, limit int) error {
+	list, err := chats.List(peer, limit)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Printf("no chat history with %s\n", peer)
+		return nil
+	}
+	for _, e := range list {
+		dir := "IN "
+		if e.Direction == "out" {
+			dir = "OUT"
+		}
+		fmt.Printf("%s %-3s %s\n", e.At.Format(time.RFC3339), dir, e.Message)
+	}
 	return nil
 }
 
