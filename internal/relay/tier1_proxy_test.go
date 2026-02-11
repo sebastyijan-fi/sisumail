@@ -291,6 +291,95 @@ func TestTier1ChannelOpenTimeout(t *testing.T) {
 	}
 }
 
+func TestTier1EnforcesMaxConnDuration(t *testing.T) {
+	reg := NewSessionRegistry()
+	serverSide, _ := net.Pipe()
+	ch := &fakeChannel{Conn: serverSide}
+	reqCh := make(chan *ssh.Request)
+	close(reqCh)
+	reg.SetSession("niklas", &Session{
+		Username: "niklas",
+		Conn: &fakeConn{open: func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+			return ch, reqCh, nil
+		}},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	p := &Tier1Proxy{
+		Listener:          ln,
+		DevRouteUser:      "niklas",
+		Registry:          reg,
+		MaxConnsPerUser:   10,
+		MaxConnsPerSource: 10,
+		MaxConnDuration:   120 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Run(ctx) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	assertClosedQuickly(t, c, 700*time.Millisecond)
+}
+
+func TestTier1EnforcesMaxBytesPerConn(t *testing.T) {
+	reg := NewSessionRegistry()
+	serverSide, clientSide := net.Pipe()
+	ch := &fakeChannel{Conn: serverSide}
+	reqCh := make(chan *ssh.Request)
+	close(reqCh)
+	reg.SetSession("niklas", &Session{
+		Username: "niklas",
+		Conn: &fakeConn{open: func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+			return ch, reqCh, nil
+		}},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	p := &Tier1Proxy{
+		Listener:          ln,
+		DevRouteUser:      "niklas",
+		Registry:          reg,
+		MaxConnsPerUser:   10,
+		MaxConnsPerSource: 10,
+		MaxBytesPerConn:   1,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Run(ctx) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Consume delivery preface first to reach proxied payload path.
+	br := bufio.NewReader(clientSide)
+	if _, err := proto.ReadSMTPDeliveryPreface(br); err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+
+	if _, err := c.Write([]byte("ab")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	assertClosedQuickly(t, c, 700*time.Millisecond)
+}
+
 func assertClosedQuickly(t *testing.T, c net.Conn, d time.Duration) {
 	t.Helper()
 

@@ -12,8 +12,7 @@ Working today:
 - Hetzner Console DNS (Cloud API) provisioning exists and is wired into the relay **if** env vars are present.
 
 Not production-ready yet:
-- Tier 2 spooler deployed as a real public MX on port 25 with a publicly trusted TLS cert for `spool.<zone>` (we currently run Tier 2 in staging on `127.0.0.1:2526`).
-- Relay-level DoS hardening (rate limits, bandwidth caps, backpressure) is not complete.
+- Full observability stack (metrics endpoint, alerting policy, SLO dashboards) is not complete.
 - Safe port-22 migration plan (product SSH on `:22` while keeping admin access) is not finalized.
 
 ## Prereqs
@@ -106,6 +105,8 @@ SISUMAIL_TIER2_TLS_KEY=                # path to key PEM for spool.<zone>
 SISUMAIL_TIER1_FAST_FAIL_MS=200        # quick offline failover to MX 20
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000    # SSH smtp-delivery channel open timeout
 SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000  # idle TCP/SSH pipe timeout
+SISUMAIL_TIER1_MAX_CONN_DURATION_MS=600000
+SISUMAIL_TIER1_MAX_BYTES_PER_CONN=10485760
 SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
 SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
 EOF

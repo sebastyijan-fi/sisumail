@@ -2,11 +2,13 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sisumail/sisumail/internal/proto"
@@ -37,6 +39,12 @@ type Tier1Proxy struct {
 	// IdleTimeout bounds stalled bidirectional pipes.
 	IdleTimeout time.Duration
 
+	// MaxConnDuration bounds total lifetime of one Tier 1 ingress connection.
+	MaxConnDuration time.Duration
+
+	// MaxBytesPerConn bounds total proxied bytes (both directions combined) per connection.
+	MaxBytesPerConn int64
+
 	mu             sync.Mutex
 	activeByUser   map[string]int
 	activeBySource map[string]int
@@ -60,6 +68,12 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 	}
 	if p.IdleTimeout <= 0 {
 		p.IdleTimeout = 2 * time.Minute
+	}
+	if p.MaxConnDuration <= 0 {
+		p.MaxConnDuration = 10 * time.Minute
+	}
+	if p.MaxBytesPerConn <= 0 {
+		p.MaxBytesPerConn = 10 << 20 // 10 MiB
 	}
 	if p.activeByUser == nil {
 		p.activeByUser = make(map[string]int)
@@ -101,8 +115,6 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 
 func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 	defer inbound.Close()
-
-	_ = inbound.SetDeadline(time.Now().Add(10 * time.Minute))
 
 	ra, _ := inbound.RemoteAddr().(*net.TCPAddr)
 	source := "unknown"
@@ -186,9 +198,26 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 	}
 
 	// Bidirectional copy. When one side closes, close the other.
+	stopDeadline := func() {}
+	if p.MaxConnDuration > 0 {
+		timer := time.AfterFunc(p.MaxConnDuration, func() {
+			_ = inbound.Close()
+			_ = ch.Close()
+		})
+		stopDeadline = func() { timer.Stop() }
+	}
+	defer stopDeadline()
+
+	budget := &byteBudget{limit: p.MaxBytesPerConn}
 	done := make(chan struct{}, 2)
-	go func() { _, _ = copyWithIdleTimeout(ch, inbound, p.IdleTimeout); done <- struct{}{} }()
-	go func() { _, _ = copyWithIdleTimeout(inbound, ch, p.IdleTimeout); done <- struct{}{} }()
+	go func() {
+		_, _ = copyWithIdleTimeoutAndBudget(ch, inbound, p.IdleTimeout, budget)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = copyWithIdleTimeoutAndBudget(inbound, ch, p.IdleTimeout, budget)
+		done <- struct{}{}
+	}()
 	<-done
 	_ = ch.Close()
 }
@@ -242,6 +271,24 @@ func (p *Tier1Proxy) releaseSource(source string) {
 }
 
 func copyWithIdleTimeout(dst io.Writer, src io.Reader, idle time.Duration) (int64, error) {
+	return copyWithIdleTimeoutAndBudget(dst, src, idle, nil)
+}
+
+var errConnByteBudgetExceeded = errors.New("tier1 connection byte budget exceeded")
+
+type byteBudget struct {
+	limit int64
+	used  atomic.Int64
+}
+
+func (b *byteBudget) add(n int64) bool {
+	if b == nil || b.limit <= 0 || n <= 0 {
+		return true
+	}
+	return b.used.Add(n) <= b.limit
+}
+
+func copyWithIdleTimeoutAndBudget(dst io.Writer, src io.Reader, idle time.Duration, budget *byteBudget) (int64, error) {
 	buf := make([]byte, 32*1024)
 	var total int64
 
@@ -265,6 +312,9 @@ func copyWithIdleTimeout(dst io.Writer, src io.Reader, idle time.Duration) (int6
 			}
 			if nw != nr {
 				return total, io.ErrShortWrite
+			}
+			if !budget.add(int64(nw)) {
+				return total, errConnByteBudgetExceeded
 			}
 		}
 		if er != nil {

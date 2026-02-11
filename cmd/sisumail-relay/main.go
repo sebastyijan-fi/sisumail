@@ -25,8 +25,8 @@ import (
 
 	"github.com/sisumail/sisumail/internal/dns/hetznercloud"
 	"github.com/sisumail/sisumail/internal/identity"
-	"github.com/sisumail/sisumail/internal/provision"
 	"github.com/sisumail/sisumail/internal/proto"
+	"github.com/sisumail/sisumail/internal/provision"
 	"github.com/sisumail/sisumail/internal/relay"
 	"github.com/sisumail/sisumail/internal/store/chatqueue"
 	"github.com/sisumail/sisumail/internal/tier2"
@@ -35,30 +35,32 @@ import (
 
 func main() {
 	var (
-		sshListen   = flag.String("ssh-listen", ":2222", "SSH gateway listen address (dev default :2222)")
-		tier1Listen = flag.String("tier1-listen", ":2525", "Tier 1 TCP proxy listen address (dev default :2525)")
-		tier1FastFailMS = flag.Int("tier1-fast-fail-ms", 200, "Tier 1 fast-fail timeout in milliseconds")
-		tier1OpenTimeoutMS = flag.Int("tier1-open-timeout-ms", 3000, "Tier 1 SSH channel-open timeout in milliseconds")
-		tier1IdleTimeoutMS = flag.Int("tier1-idle-timeout-ms", 120000, "Tier 1 idle I/O timeout in milliseconds")
-		tier1MaxPerUser = flag.Int("tier1-max-conns-per-user", 10, "Tier 1 max concurrent connections per user")
-		tier1MaxPerSource = flag.Int("tier1-max-conns-per-source", 20, "Tier 1 max concurrent connections per source IP")
-		devUser     = flag.String("dev-user", "", "dev-only: route all Tier 1 traffic to this username (empty disables)")
-		hostKeyPath = flag.String("hostkey", "./data/relay_hostkey_ed25519", "path to relay SSH host key (created if missing)")
-		dbPath      = flag.String("db", "./data/relay.db", "identity registry sqlite path")
-		initDB      = flag.Bool("init-db", false, "initialize database schema and exit")
-		addUser     = flag.Bool("add-user", false, "add/update an identity and exit (requires -username/-pubkey/-ipv6)")
-		username    = flag.String("username", "", "identity username for -add-user")
-		pubkeyPath  = flag.String("pubkey", "", "path to SSH public key file for -add-user")
-		ipv6Str     = flag.String("ipv6", "", "IPv6 address for -add-user")
-		allowClaim  = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
-		spoolDir    = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
-		chatSpoolDir = flag.String("chat-spool-dir", "/var/spool/sisumail/chat", "encrypted chat queue root (for offline delivery)")
-		chatMaxBytes = flag.Int64("chat-max-bytes", 64<<10, "max encrypted chat payload bytes per message")
-		chatLookupPerMin = flag.Int("chat-lookup-per-min", 120, "max key-lookup requests per source IP per minute")
-		chatSendPerMin = flag.Int("chat-send-per-min", 240, "max chat-send requests per source IP per minute")
-		chatSendPerUserPerMin = flag.Int("chat-send-per-user-per-min", 120, "max chat-send requests per sender username per minute")
-		chatReadTimeoutMS = flag.Int("chat-read-timeout-ms", 5000, "chat channel read/header timeout in milliseconds")
-		chatForwardTimeoutMS = flag.Int("chat-forward-timeout-ms", 5000, "chat forward/copy timeout in milliseconds")
+		sshListen              = flag.String("ssh-listen", ":2222", "SSH gateway listen address (dev default :2222)")
+		tier1Listen            = flag.String("tier1-listen", ":2525", "Tier 1 TCP proxy listen address (dev default :2525)")
+		tier1FastFailMS        = flag.Int("tier1-fast-fail-ms", 200, "Tier 1 fast-fail timeout in milliseconds")
+		tier1OpenTimeoutMS     = flag.Int("tier1-open-timeout-ms", 3000, "Tier 1 SSH channel-open timeout in milliseconds")
+		tier1IdleTimeoutMS     = flag.Int("tier1-idle-timeout-ms", 120000, "Tier 1 idle I/O timeout in milliseconds")
+		tier1MaxConnDurationMS = flag.Int("tier1-max-conn-duration-ms", 600000, "Tier 1 max connection duration in milliseconds")
+		tier1MaxBytesPerConn   = flag.Int64("tier1-max-bytes-per-conn", 10<<20, "Tier 1 max proxied bytes per connection (both directions combined)")
+		tier1MaxPerUser        = flag.Int("tier1-max-conns-per-user", 10, "Tier 1 max concurrent connections per user")
+		tier1MaxPerSource      = flag.Int("tier1-max-conns-per-source", 20, "Tier 1 max concurrent connections per source IP")
+		devUser                = flag.String("dev-user", "", "dev-only: route all Tier 1 traffic to this username (empty disables)")
+		hostKeyPath            = flag.String("hostkey", "./data/relay_hostkey_ed25519", "path to relay SSH host key (created if missing)")
+		dbPath                 = flag.String("db", "./data/relay.db", "identity registry sqlite path")
+		initDB                 = flag.Bool("init-db", false, "initialize database schema and exit")
+		addUser                = flag.Bool("add-user", false, "add/update an identity and exit (requires -username/-pubkey/-ipv6)")
+		username               = flag.String("username", "", "identity username for -add-user")
+		pubkeyPath             = flag.String("pubkey", "", "path to SSH public key file for -add-user")
+		ipv6Str                = flag.String("ipv6", "", "IPv6 address for -add-user")
+		allowClaim             = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
+		spoolDir               = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
+		chatSpoolDir           = flag.String("chat-spool-dir", "/var/spool/sisumail/chat", "encrypted chat queue root (for offline delivery)")
+		chatMaxBytes           = flag.Int64("chat-max-bytes", 64<<10, "max encrypted chat payload bytes per message")
+		chatLookupPerMin       = flag.Int("chat-lookup-per-min", 120, "max key-lookup requests per source IP per minute")
+		chatSendPerMin         = flag.Int("chat-send-per-min", 240, "max chat-send requests per source IP per minute")
+		chatSendPerUserPerMin  = flag.Int("chat-send-per-user-per-min", 120, "max chat-send requests per sender username per minute")
+		chatReadTimeoutMS      = flag.Int("chat-read-timeout-ms", 5000, "chat channel read/header timeout in milliseconds")
+		chatForwardTimeoutMS   = flag.Int("chat-forward-timeout-ms", 5000, "chat forward/copy timeout in milliseconds")
 	)
 	flag.Parse()
 
@@ -193,6 +195,8 @@ func main() {
 		FastFail:           time.Duration(*tier1FastFailMS) * time.Millisecond,
 		ChannelOpenTimeout: time.Duration(*tier1OpenTimeoutMS) * time.Millisecond,
 		IdleTimeout:        time.Duration(*tier1IdleTimeoutMS) * time.Millisecond,
+		MaxConnDuration:    time.Duration(*tier1MaxConnDurationMS) * time.Millisecond,
+		MaxBytesPerConn:    *tier1MaxBytesPerConn,
 		MaxConnsPerUser:    *tier1MaxPerUser,
 		MaxConnsPerSource:  *tier1MaxPerSource,
 		ResolveUser: func(destIP net.IP) (string, bool) {

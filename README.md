@@ -12,13 +12,10 @@ Working today (local harness + current relay):
 - Identity registry (SQLite) with first-come claim semantics and per-user IPv6 allocation from a /64.
 
 Not working yet / not complete (do not assume production-ready):
-- Tier 2 as a real public MX on `spool.<zone>:25` with a publicly trusted TLS certificate (we currently run it in staging on `127.0.0.1:2526` via `sisumail-tier2`).
-- Tier 2 delivery signaling integrated end-to-end (today it can spool ciphertext, but there is no real-time notify-to-client path yet).
 - ACME DNS-01 certificate issuance for Tier 1 device certificates (control channel not implemented).
-- TUI (Bubbletea) and mailbox UX (listing/reading mail) beyond the basic harness logging.
-- Relay hardening requirements from the whitepaper (rate limits, bandwidth caps, backpressure, strict timeouts) are not fully implemented.
-- Production port plan (moving product SSH to `:22` safely while keeping admin OpenSSH access).
 - DANE/DNSSEC and MTA-STS hardening.
+- Production observability package (metrics endpoint, alerts, SLO dashboards) is not complete yet.
+- Production port plan (moving product SSH to `:22` safely while keeping admin OpenSSH access).
 
 ## Dev Quickstart (Local Harness)
 
@@ -53,8 +50,7 @@ See `docs/dns-records.md` for the exact per-user record templates.
 
 ## Next
 Near-term build targets (in order):
-- Make Tier 2 a real spool MX service (TLS cert for `spool.<zone>`, listen on `:25`, stream-encrypt-on-ingest, ciphertext-only store).
-- Production-grade relay controls for Tier 1 (caps/timeouts/backpressure as MUSTs from `WHITEPAPER.md`).
-- DNS provisioning on claim using Hetzner Console DNS (Cloud API) token (`HCLOUD_TOKEN`).
-- Safer operator workflow: release binaries + `deploy/install.sh` + `sisumail-update` timer.
-- Client UX: Maildir storage + minimal TUI.
+- Production observability: health checks, metrics, alert thresholds, and runbooks.
+- Abuse controls beyond channel limits (SMTP ingress policies for Tier 2 and operator ban workflows).
+- ACME DNS-01 issuance flow for Tier 1 node certificates.
+- Node mode packaging and onboarding polish.
