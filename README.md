@@ -14,7 +14,7 @@ Working today (local harness + current relay):
 Not working yet / not complete (do not assume production-ready):
 - DANE/DNSSEC and MTA-STS hardening.
 - Full production alerting/SLO dashboard integration is not complete yet (basic health/readiness/metrics endpoints are available).
-- Hosted SSH shell currently exposes basic commands; full mailbox/chat UX in SSH-only mode is still in progress.
+- Hosted SSH shell is now interactive (`¤help`, `¤whoami`, `¤status`, `¤lookup`, `¤chatq`, quick chat send), but full encrypted mailbox-reading UX in SSH-only mode is still in progress.
 
 ## Access Modes (Crystal Clear)
 
@@ -36,7 +36,7 @@ Sisumail supports three user-facing modes. They are intentionally different in t
 - Trust: strongest user control, highest operational burden.
 
 Current implementation status:
-- Hosted SSH mode: basic shell commands available (iterating fast).
+- Hosted SSH mode: interactive command shell available with account bootstrap + chat send + queue/status.
 - Local session mode: most complete feature set today (mail/chat + storage + ACME relay flow).
 - Personal node mode: available but onboarding/packaging still improving.
 
@@ -93,7 +93,7 @@ go run ./cmd/sisumail \
   -shell
 ```
 
-Product SSH-only hosted session:
+Product SSH-only hosted session (zero local install):
 
 ```bash
 ssh <username>@sisumail.fi
@@ -104,9 +104,10 @@ Note: this is intentionally a different trust mode than local `sisumail` client 
 Inside shell:
 - `¤help`
 - `¤whoami`
-- `¤inbox`
-- `¤read <id>`
-- `¤history <user>`
+- `¤status`
+- `¤lookup <user>`
+- `¤chatq`
+- `¤mailq`
 - `¤<user> <message>` to send chat quickly
 
 ### 3) Simulate a sender delivering SMTP to Tier 1

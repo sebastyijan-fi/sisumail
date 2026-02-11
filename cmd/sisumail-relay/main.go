@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -138,7 +139,7 @@ func main() {
 			// Dev override: allow any key for the dev user to reduce setup friction.
 			// For production, remove this and require a provisioned identity.
 			if *devUser != "" && u == *devUser {
-				return &ssh.Permissions{}, nil
+				return &ssh.Permissions{Extensions: map[string]string{"identity_status": "dev-user"}}, nil
 			}
 
 			id, err := store.GetByUsername(ctx, u)
@@ -166,12 +167,12 @@ func main() {
 					reg.SetUserDestIPv6(u, claimed.IPv6)
 					log.Printf("claimed identity: %s -> %s", u, claimed.IPv6.String())
 				}
-				return &ssh.Permissions{}, nil
+				return &ssh.Permissions{Extensions: map[string]string{"identity_status": "claimed-new"}}, nil
 			}
 			if subtle.ConstantTimeCompare(id.PubKey.Marshal(), pubKey.Marshal()) != 1 {
 				return nil, fmt.Errorf("wrong key")
 			}
-			return &ssh.Permissions{}, nil
+			return &ssh.Permissions{Extensions: map[string]string{"identity_status": "existing"}}, nil
 		},
 	}
 	serverCfg.AddHostKey(hostKey)
@@ -320,6 +321,15 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 		return
 	}
 	source := remoteIPString(sshConn.RemoteAddr())
+	identityStatus := "existing"
+	if sshConn.Permissions != nil && sshConn.Permissions.Extensions != nil {
+		if s := strings.TrimSpace(sshConn.Permissions.Extensions["identity_status"]); s != "" {
+			identityStatus = s
+		}
+	}
+	if store != nil {
+		store.TouchLastSeen(context.Background(), user)
+	}
 
 	reg.SetSession(user, &relay.Session{Username: user, Conn: sshConn})
 	if stats != nil {
@@ -363,11 +373,21 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 						return
 					}
 					execLike := pollSessionRequests(reqs, 150*time.Millisecond)
-					if !execLike {
-						_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
-					}
 					status := uint32(0)
-					if execLike {
+					if !execLike {
+						status = runHostedShell(c, hostedShellEnv{
+							username:       user,
+							source:         source,
+							identityStatus: identityStatus,
+							store:          store,
+							reg:            reg,
+							spool:          spool,
+							chatSpool:      chatSpool,
+							guard:          chatGuard,
+							stats:          stats,
+						})
+					} else {
+						_, _ = c.Write([]byte("exec/subsystem not supported; use interactive ssh session\n"))
 						status = 1
 					}
 					_, _ = c.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: status}))
@@ -451,55 +471,70 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 	if guard != nil && guard.maxBytes > 0 && h.SizeBytes > guard.maxBytes {
 		return
 	}
-	dst, ok := reg.GetSession(h.To)
-	if !ok || dst == nil || dst.Conn == nil {
-		// Recipient offline: queue encrypted payload for later delivery.
-		if chatSpool != nil {
-			id := fmt.Sprintf("%d", time.Now().UnixNano())
-			meta := chatqueue.Meta{
-				ID:         id,
-				From:       sender,
-				To:         h.To,
-				ReceivedAt: time.Now(),
-			}
-			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
-			if stats != nil {
-				stats.IncChatQueuedOffline()
-			}
-		}
+	ct, err := io.ReadAll(io.LimitReader(br, h.SizeBytes))
+	if err != nil {
 		return
 	}
+	if int64(len(ct)) != h.SizeBytes {
+		return
+	}
+	_ = deliverOrQueueChatCiphertext(sender, h.To, bytes.NewReader(ct), h.SizeBytes, reg, chatSpool, stats)
+}
 
+func deliverOrQueueChatCiphertext(sender, to string, payload io.Reader, size int64, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, stats *observability.RelayStats) error {
+	if reg == nil || strings.TrimSpace(to) == "" || payload == nil || size < 0 {
+		return fmt.Errorf("invalid chat delivery args")
+	}
+	ct, err := io.ReadAll(io.LimitReader(payload, size))
+	if err != nil {
+		return err
+	}
+	if int64(len(ct)) != size {
+		return fmt.Errorf("chat payload size mismatch")
+	}
+
+	queue := func() error {
+		if chatSpool == nil {
+			return nil
+		}
+		id := fmt.Sprintf("%d", time.Now().UnixNano())
+		meta := chatqueue.Meta{
+			ID:         id,
+			From:       sender,
+			To:         to,
+			ReceivedAt: time.Now(),
+		}
+		if err := chatSpool.Put(to, id, bytes.NewReader(ct), meta); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.IncChatQueuedOffline()
+		}
+		return nil
+	}
+
+	dst, ok := reg.GetSession(to)
+	if !ok || dst == nil || dst.Conn == nil {
+		return queue()
+	}
 	out, outReqs, err := dst.Conn.OpenChannel("chat-delivery", nil)
 	if err != nil {
-		// Best effort fallback to queue when live open fails.
-		if chatSpool != nil {
-			id := fmt.Sprintf("%d", time.Now().UnixNano())
-			meta := chatqueue.Meta{
-				ID:         id,
-				From:       sender,
-				To:         h.To,
-				ReceivedAt: time.Now(),
-			}
-			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
-			if stats != nil {
-				stats.IncChatQueuedOffline()
-			}
-		}
-		return
+		return queue()
 	}
 	go ssh.DiscardRequests(outReqs)
 	defer out.Close()
-
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
-	dh := proto.ChatDeliveryHeader{From: sender, MessageID: id, SizeBytes: h.SizeBytes}
+	dh := proto.ChatDeliveryHeader{From: sender, MessageID: id, SizeBytes: size}
 	if err := proto.WriteChatDeliveryHeader(out, dh); err != nil {
-		return
+		return queue()
 	}
-	_, _ = copyNWithTimeout(out, br, h.SizeBytes, guardForwardTimeout(guard))
+	if _, err := io.Copy(out, bytes.NewReader(ct)); err != nil {
+		return queue()
+	}
 	if stats != nil {
 		stats.IncChatDeliveredLive()
 	}
+	return nil
 }
 
 func handleACMEDNS01Channel(ch ssh.NewChannel, user string, ctrl *acmeDNS01Controller) {
@@ -591,6 +626,216 @@ func sessionRequestAllowed(reqType string) (allow bool, execLike bool) {
 		return false, true
 	default:
 		return false, false
+	}
+}
+
+type hostedShellEnv struct {
+	username       string
+	source         string
+	identityStatus string
+	store          *identity.Store
+	reg            *relay.SessionRegistry
+	spool          *tier2.FileSpool
+	chatSpool      *chatqueue.Store
+	guard          *chatGuard
+	stats          *observability.RelayStats
+}
+
+func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
+	if ch == nil {
+		return 1
+	}
+	in := bufio.NewReader(ch)
+	_, _ = io.WriteString(ch, "Sisumail Hosted Shell\n")
+	if env.identityStatus == "claimed-new" {
+		_, _ = io.WriteString(ch, "identity claimed and bound to your SSH key\n")
+	}
+	_, _ = io.WriteString(ch, "Sisumail is receive-only identity mail + encrypted chat, not conversational outbound email.\n")
+	_, _ = io.WriteString(ch, "Commands: ¤help, ¤whoami, ¤status, ¤lookup <user>, ¤chatq, ¤mailq, ¤quit\n")
+	_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
+	for {
+		_, _ = io.WriteString(ch, "¤ ")
+		line, err := in.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return 0
+			}
+			return 1
+		}
+		kind, a, b := parseRelayShellDirective(line)
+		switch kind {
+		case "noop":
+			continue
+		case "quit":
+			return 0
+		case "help":
+			_, _ = io.WriteString(ch, "Commands:\n")
+			_, _ = io.WriteString(ch, "¤help\n¤whoami\n¤status\n¤lookup <user>\n¤chatq\n¤mailq\n¤quit\n")
+			_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
+		case "whoami":
+			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s source=%s\n", env.username, env.source))
+		case "status":
+			chatQueued := 0
+			if env.chatSpool != nil {
+				if list, err := env.chatSpool.List(env.username); err == nil {
+					chatQueued = len(list)
+				}
+			}
+			mailQueued := 0
+			if env.spool != nil {
+				if list, err := env.spool.List(env.username); err == nil {
+					mailQueued = len(list)
+				}
+			}
+			_, _ = io.WriteString(ch, fmt.Sprintf("chat_queue=%d mail_queue=%d\n", chatQueued, mailQueued))
+		case "lookup":
+			target := strings.TrimSpace(a)
+			if target == "" {
+				_, _ = io.WriteString(ch, "usage: ¤lookup <user>\n")
+				continue
+			}
+			id, err := env.lookup(target)
+			if err != nil {
+				_, _ = io.WriteString(ch, fmt.Sprintf("lookup failed: %v\n", err))
+				continue
+			}
+			if id == nil {
+				_, _ = io.WriteString(ch, "not found\n")
+				continue
+			}
+			online := false
+			if env.reg != nil {
+				_, online = env.reg.GetSession(target)
+			}
+			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s fp=%s online=%v\n", id.Username, id.Fingerprint, online))
+		case "chatq":
+			if env.chatSpool == nil {
+				_, _ = io.WriteString(ch, "chat queue unavailable\n")
+				continue
+			}
+			list, err := env.chatSpool.List(env.username)
+			if err != nil {
+				_, _ = io.WriteString(ch, fmt.Sprintf("chatq failed: %v\n", err))
+				continue
+			}
+			_, _ = io.WriteString(ch, fmt.Sprintf("queued chat messages: %d\n", len(list)))
+			for i := 0; i < len(list) && i < 10; i++ {
+				m := list[i]
+				_, _ = io.WriteString(ch, fmt.Sprintf("%s from=%s bytes=%d at=%s\n", m.ID, m.From, m.SizeBytes, m.ReceivedAt.UTC().Format(time.RFC3339)))
+			}
+		case "mailq":
+			if env.spool == nil {
+				_, _ = io.WriteString(ch, "mail queue unavailable\n")
+				continue
+			}
+			list, err := env.spool.List(env.username)
+			if err != nil {
+				_, _ = io.WriteString(ch, fmt.Sprintf("mailq failed: %v\n", err))
+				continue
+			}
+			_, _ = io.WriteString(ch, fmt.Sprintf("queued encrypted mail items: %d\n", len(list)))
+			_, _ = io.WriteString(ch, "mail bodies stay encrypted; use local sisumail client to decrypt/read.\n")
+		case "send":
+			to := strings.TrimSpace(a)
+			msg := strings.TrimSpace(b)
+			if to == "" || msg == "" {
+				_, _ = io.WriteString(ch, "usage: ¤<user> <message>\n")
+				continue
+			}
+			if err := env.sendHostedChat(to, msg); err != nil {
+				_, _ = io.WriteString(ch, fmt.Sprintf("send failed: %v\n", err))
+				continue
+			}
+			_, _ = io.WriteString(ch, "sent\n")
+		default:
+			_, _ = io.WriteString(ch, "unknown command. type ¤help\n")
+		}
+	}
+}
+
+func (env hostedShellEnv) lookup(username string) (*identity.Identity, error) {
+	if env.store == nil {
+		return nil, fmt.Errorf("identity store unavailable")
+	}
+	u := strings.TrimSpace(strings.ToLower(username))
+	if !isLookupUsernameAllowed(u) {
+		return nil, fmt.Errorf("invalid username")
+	}
+	return env.store.GetByUsername(context.Background(), u)
+}
+
+func (env hostedShellEnv) sendHostedChat(to, message string) error {
+	target, err := env.lookup(to)
+	if err != nil {
+		return err
+	}
+	if target == nil {
+		return fmt.Errorf("unknown user")
+	}
+	if env.guard != nil && (!env.guard.allowSendBySource(env.source) || !env.guard.allowSendByUser(env.username)) {
+		if env.stats != nil {
+			env.stats.IncChatSendLimited()
+		}
+		return fmt.Errorf("rate limited")
+	}
+	if env.stats != nil {
+		env.stats.IncChatSendTotal()
+	}
+	var ct bytes.Buffer
+	if err := tier2.StreamEncrypt(&ct, strings.NewReader(message), target.PubKeyText); err != nil {
+		return err
+	}
+	size := int64(ct.Len())
+	if env.guard != nil && env.guard.maxBytes > 0 && size > env.guard.maxBytes {
+		return fmt.Errorf("message too large")
+	}
+	return deliverOrQueueChatCiphertext(env.username, target.Username, bytes.NewReader(ct.Bytes()), size, env.reg, env.chatSpool, env.stats)
+}
+
+func parseRelayShellDirective(line string) (kind string, arg1 string, arg2 string) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return "noop", "", ""
+	}
+	if strings.HasPrefix(s, "/") {
+		s = "¤" + strings.TrimPrefix(s, "/")
+	}
+	if !strings.HasPrefix(s, "¤") {
+		return "unknown", "", ""
+	}
+	s = strings.TrimSpace(strings.TrimPrefix(s, "¤"))
+	if s == "" {
+		return "noop", "", ""
+	}
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return "noop", "", ""
+	}
+	cmd := strings.ToLower(parts[0])
+	switch cmd {
+	case "q", "quit", "exit":
+		return "quit", "", ""
+	case "help", "h":
+		return "help", "", ""
+	case "whoami", "me":
+		return "whoami", "", ""
+	case "status", "s":
+		return "status", "", ""
+	case "lookup", "l":
+		if len(parts) < 2 {
+			return "lookup", "", ""
+		}
+		return "lookup", parts[1], ""
+	case "chatq":
+		return "chatq", "", ""
+	case "mailq":
+		return "mailq", "", ""
+	default:
+		if len(parts) < 2 {
+			return "send", cmd, ""
+		}
+		msg := strings.TrimSpace(strings.TrimPrefix(s, parts[0]))
+		return "send", cmd, msg
 	}
 }
 

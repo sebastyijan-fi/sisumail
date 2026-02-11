@@ -23,3 +23,30 @@ func TestSessionRequestAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRelayShellDirective(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantKind string
+		wantA    string
+		wantB    string
+	}{
+		{in: "", wantKind: "noop"},
+		{in: "hello", wantKind: "unknown"},
+		{in: "¤help", wantKind: "help"},
+		{in: "/help", wantKind: "help"},
+		{in: "¤whoami", wantKind: "whoami"},
+		{in: "¤status", wantKind: "status"},
+		{in: "¤lookup niklas", wantKind: "lookup", wantA: "niklas"},
+		{in: "¤chatq", wantKind: "chatq"},
+		{in: "¤mailq", wantKind: "mailq"},
+		{in: "¤quit", wantKind: "quit"},
+		{in: "¤alice hi there", wantKind: "send", wantA: "alice", wantB: "hi there"},
+	}
+	for _, tt := range tests {
+		kind, a, b := parseRelayShellDirective(tt.in)
+		if kind != tt.wantKind || a != tt.wantA || b != tt.wantB {
+			t.Fatalf("parseRelayShellDirective(%q): got (%q,%q,%q) want (%q,%q,%q)", tt.in, kind, a, b, tt.wantKind, tt.wantA, tt.wantB)
+		}
+	}
+}

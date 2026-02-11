@@ -44,6 +44,24 @@ Follow-up fix applied:
 - Before fix: plain SSH often ended with exit code `255` despite successful banner.
 - After fix: plain SSH returns exit code `0`.
 
+## Hosted SSH Shell Dogfood (Live)
+
+Validated on live `sisumail.fi` with real users:
+
+- `ssh <user>@sisumail.fi` now opens interactive hosted shell (not banner-only).
+- Command loop worked in real sessions: `¤help`, `¤whoami`, `¤status`, `¤lookup <user>`, `¤chatq`.
+- Quick chat send worked in hosted mode: `¤<user> <message>`.
+- Recipient saw queued encrypted chat in hosted shell (`¤chatq`) when offline.
+
+Friction observed:
+
+1. Hosted shell cannot read/decrypt mail bodies (by design)
+- This is expected because mail is encrypted to user keys.
+- UX must explain this clearly and route users to local/node mode for decrypt/read.
+
+2. Command discoverability still depends on first `¤help`
+- Better than before, but we should add guided first-login copy and short examples.
+
 ## Priority Fixes (Core-only)
 
 1. `sisumail init` guided onboarding (interactive or non-interactive):

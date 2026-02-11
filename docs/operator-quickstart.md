@@ -14,7 +14,7 @@ Working today:
 
 Not production-ready yet:
 - Full observability stack (metrics endpoint, alerting policy, SLO dashboards) is not complete.
-- Hosted SSH shell UX is still basic; full command UX is under active iteration.
+- Hosted SSH shell is live and interactive, but encrypted mailbox-reading UX in hosted-only mode is still under active iteration.
 
 ## User Access Modes (Operator View)
 
@@ -23,6 +23,7 @@ Operators should communicate mode/trust expectations clearly:
 1. Hosted SSH session (`ssh <user>@sisumail.fi`)
 - Easiest access path.
 - Relay-hosted interface logic; higher relay trust.
+- No local repo clone is required for this mode.
 
 2. Local session (`sisumail` client on user machine)
 - Stronger privacy boundary; local endpoint handles keys/decryption/storage.
