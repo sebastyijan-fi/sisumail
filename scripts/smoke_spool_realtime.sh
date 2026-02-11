@@ -62,13 +62,13 @@ printf "EHLO x\r\nMAIL FROM:<s@e>\r\nRCPT TO:<mail+steam@alice.sisumail.fi>\r\nD
 
 echo "[smoke-rt] wait for real-time spool-delivery signal"
 for _ in $(seq 1 40); do
-  if rg -n "spool-delivery: msg=" "$tmp/client.out" >/dev/null; then
+  if rg -n "spool-delivery: (msg=|stored msg=)" "$tmp/client.out" >/dev/null; then
     break
   fi
   sleep 0.2
 done
 
-if ! rg -n "spool-delivery: msg=" "$tmp/client.out" >/dev/null; then
+if ! rg -n "spool-delivery: (msg=|stored msg=)" "$tmp/client.out" >/dev/null; then
   echo "[smoke-rt] FAIL: no realtime spool-delivery observed"
   echo "--- client output ---"
   cat "$tmp/client.out"

@@ -66,7 +66,7 @@ timeout 6s go run ./cmd/sisumail \
 code=$?
 set -e
 
-if ! rg -n "spool-delivery: msg=" "$out" >/dev/null; then
+if ! rg -n "spool-delivery: (msg=|stored msg=)" "$out" >/dev/null; then
   echo "[smoke] FAIL: did not observe spool-delivery in client output"
   echo "--- client output ---"
   cat "$out"
@@ -86,4 +86,3 @@ fi
 
 echo "[smoke] OK"
 exit 0
-
