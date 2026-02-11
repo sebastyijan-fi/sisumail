@@ -11,6 +11,10 @@ Sisumail is not trying to replace conversational email workflows. It is a sovere
 
 Sisumail also provides end-to-end encrypted (E2E) user-to-user chat using the same identity keys. The relay routes encrypted blobs but cannot read chat content.
 
+Reader orientation:
+- Sisumail is **not** "email without reply"; it is a cryptographically owned receive-only identity anchor for internet account workflows.
+- SSH is the protocol/auth/authz layer, **not** a permanent UX limitation. Terminal UX is first, but third-party clients can implement richer interfaces on top.
+
 ## 1. Motivation
 Most users do not primarily need a full outbound/inbound email suite for rich conversation. They need a mailbox they cryptographically own for registrations, verifications, recovery flows, and notifications across internet services.
 
