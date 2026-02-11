@@ -45,9 +45,22 @@ type Tier1Proxy struct {
 	// MaxBytesPerConn bounds total proxied bytes (both directions combined) per connection.
 	MaxBytesPerConn int64
 
+	// Observer receives proxy lifecycle/events for metrics.
+	Observer Tier1Observer
+
 	mu             sync.Mutex
 	activeByUser   map[string]int
 	activeBySource map[string]int
+}
+
+type Tier1Observer interface {
+	OnListening(addr string)
+	OnAccepted()
+	OnClosed()
+	OnRejected(reason string)
+	OnChannelOpenTimeout()
+	OnChannelOpenError()
+	OnPrefaceError()
 }
 
 func (p *Tier1Proxy) Run(ctx context.Context) error {
@@ -93,6 +106,9 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 	defer ln.Close()
 
 	log.Printf("tier1 proxy listening on %s", p.ListenAddr)
+	if p.Observer != nil {
+		p.Observer.OnListening(p.ListenAddr)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -122,6 +138,9 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 		source = ra.IP.String()
 	}
 	if !p.tryAcquireSource(source) {
+		if p.Observer != nil {
+			p.Observer.OnRejected("source_cap")
+		}
 		p.fastFail(inbound)
 		return
 	}
@@ -140,12 +159,18 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 		u, ok := p.ResolveUser(la.IP)
 		if !ok {
 			// Unknown dest IP: fail fast.
+			if p.Observer != nil {
+				p.Observer.OnRejected("unknown_dest")
+			}
 			p.fastFail(inbound)
 			return
 		}
 		user = u
 	}
 	if !p.tryAcquireUser(user) {
+		if p.Observer != nil {
+			p.Observer.OnRejected("user_cap")
+		}
 		p.fastFail(inbound)
 		return
 	}
@@ -154,8 +179,15 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 	sess, ok := p.Registry.GetSession(user)
 	if !ok {
 		// Fast fail: abort quickly so MTAs attempt alternate MX.
+		if p.Observer != nil {
+			p.Observer.OnRejected("no_session")
+		}
 		p.fastFail(inbound)
 		return
+	}
+	if p.Observer != nil {
+		p.Observer.OnAccepted()
+		defer p.Observer.OnClosed()
 	}
 
 	type openRes struct {
@@ -176,10 +208,18 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 	select {
 	case res := <-resCh:
 		if res.err != nil {
+			if p.Observer != nil {
+				p.Observer.OnChannelOpenError()
+				p.Observer.OnRejected("open_failed")
+			}
 			return
 		}
 		ch = res.ch
 	case <-time.After(p.ChannelOpenTimeout):
+		if p.Observer != nil {
+			p.Observer.OnChannelOpenTimeout()
+			p.Observer.OnRejected("open_timeout")
+		}
 		p.fastFail(inbound)
 		return
 	}
@@ -193,6 +233,9 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 		ReceivedAt: time.Now(),
 	}
 	if err := proto.WriteSMTPDeliveryPreface(ch, meta); err != nil {
+		if p.Observer != nil {
+			p.Observer.OnPrefaceError()
+		}
 		_ = ch.Close()
 		return
 	}

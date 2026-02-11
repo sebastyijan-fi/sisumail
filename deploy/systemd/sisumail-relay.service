@@ -9,6 +9,7 @@ EnvironmentFile=/etc/sisumail.env
 ExecStart=/bin/sh -c '/usr/local/bin/sisumail-relay \
   -ssh-listen :2222 \
   -tier1-listen :2525 \
+  -obs-listen "${SISUMAIL_OBS_LISTEN:-127.0.0.1:9090}" \
   -tier1-fast-fail-ms "${SISUMAIL_TIER1_FAST_FAIL_MS:-200}" \
   -tier1-open-timeout-ms "${SISUMAIL_TIER1_OPEN_TIMEOUT_MS:-3000}" \
   -tier1-idle-timeout-ms "${SISUMAIL_TIER1_IDLE_TIMEOUT_MS:-120000}" \

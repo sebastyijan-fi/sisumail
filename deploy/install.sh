@@ -80,6 +80,7 @@ EnvironmentFile=/etc/sisumail.env
 ExecStart=/usr/local/bin/sisumail-relay \
   -ssh-listen :2222 \
   -tier1-listen :2525 \
+  -obs-listen "${SISUMAIL_OBS_LISTEN:-127.0.0.1:9090}" \
   -tier1-fast-fail-ms "${SISUMAIL_TIER1_FAST_FAIL_MS:-200}" \
   -tier1-open-timeout-ms "${SISUMAIL_TIER1_OPEN_TIMEOUT_MS:-3000}" \
   -tier1-idle-timeout-ms "${SISUMAIL_TIER1_IDLE_TIMEOUT_MS:-120000}" \
@@ -222,6 +223,7 @@ ensure_env_file() {
 # SISUMAIL_TIER2_LISTEN: Tier 2 SMTP bind (staging default 127.0.0.1:2526, production :25)
 # SISUMAIL_TIER2_TLS_MODE: disable|opportunistic|required (production: required)
 # SISUMAIL_TIER2_TLS_CERT / SISUMAIL_TIER2_TLS_KEY: cert/key for spool.<zone> STARTTLS
+# SISUMAIL_OBS_LISTEN: local observability endpoint, e.g. 127.0.0.1:9090
 # SISUMAIL_TIER1_*: Tier 1 hardening controls.
 HCLOUD_TOKEN=
 SISUMAIL_DNS_ZONE=
@@ -230,6 +232,7 @@ SISUMAIL_TIER2_LISTEN=127.0.0.1:2526
 SISUMAIL_TIER2_TLS_MODE=opportunistic
 SISUMAIL_TIER2_TLS_CERT=
 SISUMAIL_TIER2_TLS_KEY=
+SISUMAIL_OBS_LISTEN=127.0.0.1:9090
 SISUMAIL_TIER1_FAST_FAIL_MS=200
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000
 SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000

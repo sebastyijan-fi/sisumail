@@ -102,6 +102,7 @@ SISUMAIL_TIER2_LISTEN=127.0.0.1:2526   # staging default; set to :25 for product
 SISUMAIL_TIER2_TLS_MODE=opportunistic  # disable|opportunistic|required (production: required)
 SISUMAIL_TIER2_TLS_CERT=               # path to cert PEM for spool.<zone>
 SISUMAIL_TIER2_TLS_KEY=                # path to key PEM for spool.<zone>
+SISUMAIL_OBS_LISTEN=127.0.0.1:9090     # relay health/readiness/metrics HTTP
 SISUMAIL_TIER1_FAST_FAIL_MS=200        # quick offline failover to MX 20
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000    # SSH smtp-delivery channel open timeout
 SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000  # idle TCP/SSH pipe timeout
@@ -179,6 +180,16 @@ Inspect relay logs:
 ```bash
 journalctl -u sisumail-relay -n 200 --no-pager
 ```
+
+Observe service health locally:
+
+```bash
+curl -fsS http://127.0.0.1:9090/-/healthz
+curl -fsS http://127.0.0.1:9090/-/readyz
+curl -fsS http://127.0.0.1:9090/metrics | head
+```
+
+`/-/readyz` returns `503` until both SSH gateway and Tier 1 listeners are active.
 
 ## 10) Production Cutover (Later)
 

@@ -25,6 +25,7 @@ import (
 
 	"github.com/sisumail/sisumail/internal/dns/hetznercloud"
 	"github.com/sisumail/sisumail/internal/identity"
+	"github.com/sisumail/sisumail/internal/observability"
 	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/provision"
 	"github.com/sisumail/sisumail/internal/relay"
@@ -61,6 +62,8 @@ func main() {
 		chatSendPerUserPerMin  = flag.Int("chat-send-per-user-per-min", 120, "max chat-send requests per sender username per minute")
 		chatReadTimeoutMS      = flag.Int("chat-read-timeout-ms", 5000, "chat channel read/header timeout in milliseconds")
 		chatForwardTimeoutMS   = flag.Int("chat-forward-timeout-ms", 5000, "chat forward/copy timeout in milliseconds")
+		obsListen              = flag.String("obs-listen", "", "observability HTTP listen address (disabled when empty), e.g. 127.0.0.1:9090")
+		obsReadHeaderTimeoutMS = flag.Int("obs-read-header-timeout-ms", 5000, "observability HTTP read-header timeout in milliseconds")
 	)
 	flag.Parse()
 
@@ -171,6 +174,9 @@ func main() {
 	spool := &tier2.FileSpool{Root: *spoolDir}
 	chatSpool := &chatqueue.Store{Root: *chatSpoolDir}
 	spoolPump := newSpoolDeliveryPump()
+	stats := observability.NewRelayStats()
+	ready := &relayReadiness{}
+	tier1Obs := &tier1MetricsObserver{stats: stats, ready: ready}
 	chatGuard := newChatGuard(chatGuardConfig{
 		MaxBytes:          *chatMaxBytes,
 		LookupPerMinute:   *chatLookupPerMin,
@@ -181,12 +187,12 @@ func main() {
 	})
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump, stats, ready.setSSHListening); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
 	}()
-	go runSpoolNotifyLoop(ctx, reg, spool, spoolPump)
+	go runSpoolNotifyLoop(ctx, reg, spool, spoolPump, stats)
 
 	proxy := &relay.Tier1Proxy{
 		ListenAddr:         *tier1Listen,
@@ -199,6 +205,7 @@ func main() {
 		MaxBytesPerConn:    *tier1MaxBytesPerConn,
 		MaxConnsPerUser:    *tier1MaxPerUser,
 		MaxConnsPerSource:  *tier1MaxPerSource,
+		Observer:           tier1Obs,
 		ResolveUser: func(destIP net.IP) (string, bool) {
 			return reg.GetUserByDestIPv6(destIP)
 		},
@@ -209,6 +216,15 @@ func main() {
 			cancel()
 		}
 	}()
+
+	if strings.TrimSpace(*obsListen) != "" {
+		go func() {
+			if err := runObservabilityServer(ctx, *obsListen, stats, ready.status, time.Duration(*obsReadHeaderTimeoutMS)*time.Millisecond); err != nil {
+				log.Printf("observability server error: %v", err)
+				cancel()
+			}
+		}()
+	}
 
 	<-ctx.Done()
 }
@@ -254,7 +270,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, stats *observability.RelayStats, onListening func()) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -262,6 +278,9 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 	defer ln.Close()
 
 	log.Printf("ssh gateway listening on %s", addr)
+	if onListening != nil {
+		onListening()
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -278,11 +297,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump, stats)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, stats *observability.RelayStats) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -298,19 +317,25 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	source := remoteIPString(sshConn.RemoteAddr())
 
 	reg.SetSession(user, &relay.Session{Username: user, Conn: sshConn})
+	if stats != nil {
+		stats.IncSSHSessions(1)
+	}
 	log.Printf("ssh session registered: user=%s remote=%s", user, sshConn.RemoteAddr())
 	defer func() {
 		reg.DeleteSession(user)
+		if stats != nil {
+			stats.IncSSHSessions(-1)
+		}
 		log.Printf("ssh session deregistered: user=%s", user)
 	}()
 
 	// Deliver any pending Tier 2 spool entries for this user (best-effort).
 	// This keeps the "spool on reconnect" promise without requiring polling.
 	if spool != nil && pump != nil {
-		go deliverPendingSpool(ctx, sshConn, user, spool, pump, true)
+		go deliverPendingSpool(ctx, sshConn, user, spool, pump, true, stats)
 	}
 	if chatSpool != nil {
-		go deliverPendingChat(ctx, sshConn, user, chatSpool, true)
+		go deliverPendingChat(ctx, sshConn, user, chatSpool, true, stats)
 	}
 
 	// Ignore global requests.
@@ -336,9 +361,9 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
 					_ = c.Close()
 				case "key-lookup":
-					handleKeyLookupChannel(ch, store, source, chatGuard)
+					handleKeyLookupChannel(ch, store, source, chatGuard, stats)
 				case "chat-send":
-					handleChatSendChannel(ch, user, source, reg, chatSpool, chatGuard)
+					handleChatSendChannel(ch, user, source, reg, chatSpool, chatGuard, stats)
 				default:
 					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
 					return
@@ -348,7 +373,7 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	}
 }
 
-func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store, source string, guard *chatGuard) {
+func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store, source string, guard *chatGuard, stats *observability.RelayStats) {
 	c, reqs, err := ch.Accept()
 	if err != nil {
 		return
@@ -357,7 +382,13 @@ func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store, source str
 	defer c.Close()
 
 	if guard != nil && !guard.allowLookup(source) {
+		if stats != nil {
+			stats.IncChatLookupLimited()
+		}
 		return
+	}
+	if stats != nil {
+		stats.IncChatLookupTotal()
 	}
 	if store == nil {
 		_ = proto.WriteKeyLookupResponse(c, "")
@@ -379,7 +410,7 @@ func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store, source str
 	_ = proto.WriteKeyLookupResponse(c, id.PubKeyText)
 }
 
-func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, guard *chatGuard) {
+func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, guard *chatGuard, stats *observability.RelayStats) {
 	c, reqs, err := ch.Accept()
 	if err != nil {
 		return
@@ -388,7 +419,13 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 	defer c.Close()
 
 	if guard != nil && (!guard.allowSendBySource(source) || !guard.allowSendByUser(sender)) {
+		if stats != nil {
+			stats.IncChatSendLimited()
+		}
 		return
+	}
+	if stats != nil {
+		stats.IncChatSendTotal()
 	}
 	h, br, err := readChatSendHeaderWithTimeout(c, guardReadTimeout(guard))
 	if err != nil {
@@ -412,6 +449,9 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 				ReceivedAt: time.Now(),
 			}
 			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
+			if stats != nil {
+				stats.IncChatQueuedOffline()
+			}
 		}
 		return
 	}
@@ -428,6 +468,9 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 				ReceivedAt: time.Now(),
 			}
 			_ = chatSpool.Put(h.To, id, io.LimitReader(br, h.SizeBytes), meta)
+			if stats != nil {
+				stats.IncChatQueuedOffline()
+			}
 		}
 		return
 	}
@@ -440,9 +483,12 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 		return
 	}
 	_, _ = copyNWithTimeout(out, br, h.SizeBytes, guardForwardTimeout(guard))
+	if stats != nil {
+		stats.IncChatDeliveredLive()
+	}
 }
 
-func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool) {
+func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool, stats *observability.RelayStats) {
 	if chOpen == nil || q == nil || strings.TrimSpace(user) == "" {
 		return
 	}
@@ -487,6 +533,10 @@ func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user
 		case err := <-ackCh:
 			if err == nil {
 				_ = q.Ack(user, meta.ID)
+				if stats != nil {
+					stats.IncChatAcked()
+					stats.IncChatDeliveredFromQueue()
+				}
 			}
 		case <-time.After(3 * time.Second):
 			// Keep queued entry for retry on next reconnect.
@@ -665,7 +715,7 @@ func copyNWithTimeout(dst io.Writer, src io.Reader, n int64, timeout time.Durati
 	}
 }
 
-func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
+func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump, stats *observability.RelayStats) {
 	if reg == nil || spool == nil || pump == nil {
 		return
 	}
@@ -684,13 +734,13 @@ func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *
 				if !ok || sess == nil || sess.Conn == nil {
 					continue
 				}
-				go deliverPendingSpool(ctx, sess.Conn, user, spool, pump, false)
+				go deliverPendingSpool(ctx, sess.Conn, user, spool, pump, false, stats)
 			}
 		}
 	}
 }
 
-func deliverPendingSpool(ctx context.Context, chOpen relay.SSHChannelOpener, user string, spool *tier2.FileSpool, pump *spoolDeliveryPump, initialDelay bool) {
+func deliverPendingSpool(ctx context.Context, chOpen relay.SSHChannelOpener, user string, spool *tier2.FileSpool, pump *spoolDeliveryPump, initialDelay bool, stats *observability.RelayStats) {
 	if chOpen == nil || user == "" || spool == nil || pump == nil {
 		return
 	}
@@ -747,6 +797,10 @@ func deliverPendingSpool(ctx context.Context, chOpen relay.SSHChannelOpener, use
 		case err := <-ackCh:
 			if err == nil {
 				_ = spool.Ack(user, meta.MessageID)
+				if stats != nil {
+					stats.IncSpoolDelivered()
+					stats.IncSpoolAcked()
+				}
 			}
 		case <-time.After(3 * time.Second):
 			// Best-effort; client may be offline/slow. Keep the spool entry.

@@ -14,7 +14,7 @@ Working today (local harness + current relay):
 Not working yet / not complete (do not assume production-ready):
 - ACME DNS-01 certificate issuance for Tier 1 device certificates (control channel not implemented).
 - DANE/DNSSEC and MTA-STS hardening.
-- Production observability package (metrics endpoint, alerts, SLO dashboards) is not complete yet.
+- Full production alerting/SLO dashboard integration is not complete yet (basic health/readiness/metrics endpoints are available).
 - Production port plan (moving product SSH to `:22` safely while keeping admin OpenSSH access).
 
 ## Dev Quickstart (Local Harness)
@@ -47,6 +47,8 @@ You should see the SMTP banner from the client's local SMTP daemon, because the 
 ## DNS (Split MX)
 
 See `docs/dns-records.md` for the exact per-user record templates.
+
+For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-runbook.md`.
 
 ## Next
 Near-term build targets (in order):
