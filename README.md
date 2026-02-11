@@ -12,10 +12,33 @@ Working today (local harness + current relay):
 - Identity registry (SQLite) with first-come claim semantics and per-user IPv6 allocation from a /64.
 
 Not working yet / not complete (do not assume production-ready):
-- Relay-mediated ACME control channel is not implemented yet (client-side DNS-01 automation is available).
 - DANE/DNSSEC and MTA-STS hardening.
 - Full production alerting/SLO dashboard integration is not complete yet (basic health/readiness/metrics endpoints are available).
-- Production port plan (moving product SSH to `:22` safely while keeping admin OpenSSH access).
+- Hosted SSH shell currently exposes basic commands; full mailbox/chat UX in SSH-only mode is still in progress.
+
+## Access Modes (Crystal Clear)
+
+Sisumail supports three user-facing modes. They are intentionally different in trust assumptions.
+
+1. Hosted SSH Session (easiest)
+- Login: `ssh <username>@sisumail.fi`
+- Goal: instant access, no local install.
+- Trust: higher relay trust (session/UI runs on relay side).
+
+2. Local Session (sovereign default)
+- Run local client binary (`sisumail`) against `sisumail.fi`.
+- Goal: keep keys/decryption/storage on user device.
+- Trust: stronger privacy boundary (relay routes, local endpoint handles content).
+
+3. Personal Node (power users)
+- Always-on user-managed node/domain.
+- Goal: persistence and control.
+- Trust: strongest user control, highest operational burden.
+
+Current implementation status:
+- Hosted SSH mode: basic shell commands available (iterating fast).
+- Local session mode: most complete feature set today (mail/chat + storage + ACME relay flow).
+- Personal node mode: available but onboarding/packaging still improving.
 
 ## Dev Quickstart (Local Harness)
 
@@ -68,6 +91,14 @@ go run ./cmd/sisumail \
   -shell
 ```
 
+Product SSH-only hosted session:
+
+```bash
+ssh <username>@sisumail.fi
+```
+
+Note: this is intentionally a different trust mode than local `sisumail` client usage.
+
 Inside shell:
 - `¤help`
 - `¤whoami`
@@ -91,6 +122,7 @@ See `docs/dns-records.md` for the exact per-user record templates.
 For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-runbook.md`.
 For real relay-mediated ACME verification on an operator host, use `scripts/smoke_acme_relay_live.sh`.
 Latest live dogfooding findings are tracked in `docs/dogfood-notes-2026-02-11.md`.
+Access-mode trust differences are documented in `docs/access-modes.md`.
 
 ## Next
 Near-term build targets (in order):

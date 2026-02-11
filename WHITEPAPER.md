@@ -63,6 +63,18 @@ Two usage modes share the same identity:
 - **Terminal mode:** the user's local client is online only while connected.
 - **Node mode:** an always-on device maintains a persistent connection and local storage.
 
+In operational deployments, Sisumail may also expose a **hosted SSH session mode** for instant access (`ssh <user>@sisumail.fi`) where interface logic runs on relay infrastructure. This improves onboarding simplicity but has a different trust profile than terminal/node edge execution.
+
+### 3.1 Access Modes and Trust Boundaries
+
+Sisumail intentionally distinguishes access modes:
+
+- **Hosted SSH session (easy access):** minimal setup; higher relay trust.
+- **Terminal/local session (sovereign default):** local client handles keys/decryption/storage; stronger privacy boundary.
+- **Node session (power):** always-on user-managed endpoint; strongest user control with operational overhead.
+
+Security claims in this document (especially Tier 1 endpoint trust assumptions) are strongest in terminal/node modes where the user endpoint remains the TLS/decryption boundary.
+
 ## 4. Identity Model
 
 ### 4.1 SSH Key as Root Credential

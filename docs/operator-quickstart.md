@@ -10,10 +10,25 @@ Working today:
 - Tier 1 proxy + SSH gateway (dev ports by default).
 - Identity registry (SQLite) and first-come claim semantics.
 - Hetzner Console DNS (Cloud API) provisioning exists and is wired into the relay **if** env vars are present.
+- Product SSH endpoint on `:22` with admin OpenSSH on `:22222` can be run safely.
 
 Not production-ready yet:
 - Full observability stack (metrics endpoint, alerting policy, SLO dashboards) is not complete.
-- Safe port-22 migration plan (product SSH on `:22` while keeping admin access) is not finalized.
+- Hosted SSH shell UX is still basic; full command UX is under active iteration.
+
+## User Access Modes (Operator View)
+
+Operators should communicate mode/trust expectations clearly:
+
+1. Hosted SSH session (`ssh <user>@sisumail.fi`)
+- Easiest access path.
+- Relay-hosted interface logic; higher relay trust.
+
+2. Local session (`sisumail` client on user machine)
+- Stronger privacy boundary; local endpoint handles keys/decryption/storage.
+
+3. Personal node
+- User-managed always-on endpoint for maximum control.
 
 ## Prereqs
 
