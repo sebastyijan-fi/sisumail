@@ -32,18 +32,27 @@ func TestParseRelayShellDirective(t *testing.T) {
 		wantB    string
 	}{
 		{in: "", wantKind: "noop"},
-		{in: "hello", wantKind: "unknown"},
+		{in: "hello", wantKind: "send", wantA: "hello"},
 		{in: "¤help", wantKind: "help"},
+		{in: "help", wantKind: "help"},
 		{in: "¤examples", wantKind: "examples"},
+		{in: "examples", wantKind: "examples"},
 		{in: "¤x", wantKind: "examples"},
 		{in: "/help", wantKind: "help"},
 		{in: "¤whoami", wantKind: "whoami"},
+		{in: "whoami", wantKind: "whoami"},
 		{in: "¤status", wantKind: "status"},
+		{in: "status", wantKind: "status"},
 		{in: "¤lookup niklas", wantKind: "lookup", wantA: "niklas"},
+		{in: "lookup niklas", wantKind: "lookup", wantA: "niklas"},
 		{in: "¤chatq", wantKind: "chatq"},
+		{in: "chatq", wantKind: "chatq"},
 		{in: "¤mailq", wantKind: "mailq"},
+		{in: "mailq", wantKind: "mailq"},
 		{in: "¤quit", wantKind: "quit"},
+		{in: "quit", wantKind: "quit"},
 		{in: "¤alice hi there", wantKind: "send", wantA: "alice", wantB: "hi there"},
+		{in: "alice hi there", wantKind: "send", wantA: "alice", wantB: "hi there"},
 	}
 	for _, tt := range tests {
 		kind, a, b := parseRelayShellDirective(tt.in)

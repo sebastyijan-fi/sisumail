@@ -663,10 +663,9 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 		_, _ = io.WriteString(ch, "identity claimed and bound to your SSH key\n")
 	}
 	_, _ = io.WriteString(ch, "Sisumail is receive-only identity mail + encrypted chat, not conversational outbound email.\n")
-	_, _ = io.WriteString(ch, "Commands: ¤help, ¤examples, ¤whoami, ¤status, ¤lookup <user>, ¤chatq, ¤mailq, ¤quit\n")
-	_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
+	_, _ = io.WriteString(ch, "Type help (or /help). Quick chat send: <user> <message>\n")
 	for {
-		_, _ = io.WriteString(ch, "¤ ")
+		_, _ = io.WriteString(ch, "sisu> ")
 		line, err := in.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -682,14 +681,15 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 			return 0
 		case "help":
 			_, _ = io.WriteString(ch, "Commands:\n")
-			_, _ = io.WriteString(ch, "¤help\n¤examples\n¤whoami\n¤status\n¤lookup <user>\n¤chatq\n¤mailq\n¤quit\n")
-			_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
+			_, _ = io.WriteString(ch, "help\nexamples\nwhoami\nstatus\nlookup <user>\nchatq\nmailq\nquit\n")
+			_, _ = io.WriteString(ch, "You can also prefix commands with / or ¤.\n")
+			_, _ = io.WriteString(ch, "Quick chat send: <user> <message>\n")
 		case "examples":
 			_, _ = io.WriteString(ch, "Examples:\n")
-			_, _ = io.WriteString(ch, "¤lookup niklas\n")
-			_, _ = io.WriteString(ch, "¤niklas hello from hosted shell\n")
-			_, _ = io.WriteString(ch, "¤status\n")
-			_, _ = io.WriteString(ch, "¤chatq\n")
+			_, _ = io.WriteString(ch, "lookup niklas\n")
+			_, _ = io.WriteString(ch, "niklas hello from hosted shell\n")
+			_, _ = io.WriteString(ch, "status\n")
+			_, _ = io.WriteString(ch, "chatq\n")
 		case "whoami":
 			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s source=%s\n", env.username, env.source))
 		case "status":
@@ -823,13 +823,11 @@ func parseRelayShellDirective(line string) (kind string, arg1 string, arg2 strin
 	if s == "" {
 		return "noop", "", ""
 	}
-	if strings.HasPrefix(s, "/") {
-		s = "¤" + strings.TrimPrefix(s, "/")
+	if strings.HasPrefix(s, "¤") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "¤"))
+	} else if strings.HasPrefix(s, "/") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "/"))
 	}
-	if !strings.HasPrefix(s, "¤") {
-		return "unknown", "", ""
-	}
-	s = strings.TrimSpace(strings.TrimPrefix(s, "¤"))
 	if s == "" {
 		return "noop", "", ""
 	}

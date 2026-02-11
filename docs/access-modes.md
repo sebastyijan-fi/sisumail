@@ -7,7 +7,7 @@ Sisumail intentionally supports multiple access modes. They are not equivalent i
 - Entry: `ssh <username>@sisumail.fi`
 - Best for: instant access and onboarding.
 - Tradeoff: interface/session logic runs on relay infrastructure, so relay trust is higher.
-- Current UX: interactive hosted shell (`¤help`) including identity status, lookup, queue/status, and quick encrypted chat send.
+- Current UX: interactive hosted shell (`help`) including identity status, lookup, queue/status, and quick encrypted chat send.
 
 ## 2) Local Session (sovereign default)
 

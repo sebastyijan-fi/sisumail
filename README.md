@@ -14,7 +14,7 @@ Working today (local harness + current relay):
 Not working yet / not complete (do not assume production-ready):
 - DANE/DNSSEC and MTA-STS hardening.
 - Full production alerting/SLO dashboard integration is not complete yet (basic health/readiness/metrics endpoints are available).
-- Hosted SSH shell is now interactive (`¤help`, `¤whoami`, `¤status`, `¤lookup`, `¤chatq`, quick chat send), but full encrypted mailbox-reading UX in SSH-only mode is still in progress.
+- Hosted SSH shell is now interactive (`help`, `whoami`, `status`, `lookup`, `chatq`, quick chat send), but full encrypted mailbox-reading UX in SSH-only mode is still in progress.
 
 ## Access Modes (Crystal Clear)
 
@@ -118,14 +118,15 @@ ssh <username>@sisumail.fi
 Note: this is intentionally a different trust mode than local `sisumail` client usage.
 
 Inside shell:
-- `¤help`
-- `¤examples`
-- `¤whoami`
-- `¤status`
-- `¤lookup <user>`
-- `¤chatq`
-- `¤mailq`
-- `¤<user> <message>` to send chat quickly
+- `help`
+- `examples`
+- `whoami`
+- `status`
+- `lookup <user>`
+- `chatq`
+- `mailq`
+- `<user> <message>` to send chat quickly
+  - Optional command prefixes are still accepted: `/` and `¤`.
   - Output shows delivery mode explicitly: `delivered-live` or `queued-encrypted`.
 
 ### 3) Simulate a sender delivering SMTP to Tier 1
