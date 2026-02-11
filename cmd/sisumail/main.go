@@ -446,33 +446,50 @@ func readSummary(store *maildir.Store, id string) (from string, subject string) 
 func runInboxTUI(store *maildir.Store) error {
 	in := bufio.NewReader(os.Stdin)
 	filter := inboxFilterAll
+	search := ""
+	page := 1
+	const pageSize = 20
 
 	for {
 		entries, err := store.List()
 		if err != nil {
 			return err
 		}
-		view := applyInboxFilter(entries, filter)
+		filtered := applyInboxFilter(entries, filter)
+		rows := buildInboxRows(store, filtered)
+		rows = applySearchRows(rows, search)
+		pageRows, totalPages := paginateRows(rows, page, pageSize)
+		if page > totalPages {
+			page = totalPages
+			pageRows, totalPages = paginateRows(rows, page, pageSize)
+		}
+		if page < 1 {
+			page = 1
+		}
 
 		fmt.Println()
 		fmt.Println("Sisumail Inbox (live)")
 		fmt.Println("==============")
 		fmt.Printf("Filter: %s\n", filter)
-		if len(view) == 0 {
+		if strings.TrimSpace(search) != "" {
+			fmt.Printf("Search: %q\n", search)
+		}
+		fmt.Printf("Page: %d/%d (total %d)\n", page, totalPages, len(rows))
+		if len(pageRows) == 0 {
 			fmt.Println("(empty)")
 		} else {
 			fmt.Printf("%-4s %-30s %-14s %-7s %-20s %s\n", "NO", "ID", "TIER", "STATE", "FROM", "SUBJECT")
-			for i, e := range view {
-				from, subj := readSummary(store, e.ID)
+			for i, r := range pageRows {
+				e := r.Entry
 				state := "unread"
 				if e.Seen {
 					state = "read"
 				}
-				fmt.Printf("%-4d %-30s %-14s %-7s %-20s %s\n", i+1, e.ID, tierBadge(e.Tier), state, from, subj)
+				fmt.Printf("%-4d %-30s %-14s %-7s %-20s %s\n", i+1, e.ID, tierBadge(e.Tier), state, r.From, r.Subject)
 			}
 		}
 		fmt.Println()
-		fmt.Print("Command [number=open, m <n>=mark-read, d <n>=delete, x <n>=archive, a|1|2|u filter, r refresh, q quit]: ")
+		fmt.Print("Command [number=open, m/d/x <n>, a|1|2|u filter, /term search, / clear, n/p page, r refresh, q quit]: ")
 
 		line, err := in.ReadString('\n')
 		if err != nil {
@@ -486,61 +503,85 @@ func runInboxTUI(store *maildir.Store) error {
 			return nil
 		case "a":
 			filter = inboxFilterAll
+			page = 1
 			continue
 		case "1":
 			filter = inboxFilterTier1
+			page = 1
 			continue
 		case "2":
 			filter = inboxFilterTier2
+			page = 1
 			continue
 		case "u":
 			filter = inboxFilterUnread
+			page = 1
+			continue
+		case "n":
+			if page < totalPages {
+				page++
+			}
+			continue
+		case "p":
+			if page > 1 {
+				page--
+			}
+			continue
+		case "/":
+			search = ""
+			page = 1
+			continue
+		}
+		if strings.HasPrefix(cmd, "/") {
+			search = strings.TrimSpace(strings.TrimPrefix(cmd, "/"))
+			page = 1
 			continue
 		}
 
 		if strings.HasPrefix(cmd, "m ") {
 			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "m ")))
-			if err != nil || n < 1 || n > len(view) {
+			if err != nil || n < 1 || n > len(pageRows) {
 				fmt.Println("invalid selection")
 				continue
 			}
-			if err := store.MarkRead(view[n-1].ID); err != nil {
+			if err := store.MarkRead(pageRows[n-1].Entry.ID); err != nil {
 				fmt.Printf("mark-read failed: %v\n", err)
 			}
 			continue
 		}
 		if strings.HasPrefix(cmd, "d ") {
 			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "d ")))
-			if err != nil || n < 1 || n > len(view) {
+			if err != nil || n < 1 || n > len(pageRows) {
 				fmt.Println("invalid selection")
 				continue
 			}
-			if err := store.Delete(view[n-1].ID); err != nil {
+			if err := store.Delete(pageRows[n-1].Entry.ID); err != nil {
 				fmt.Printf("delete failed: %v\n", err)
 			}
 			continue
 		}
 		if strings.HasPrefix(cmd, "x ") {
 			n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "x ")))
-			if err != nil || n < 1 || n > len(view) {
+			if err != nil || n < 1 || n > len(pageRows) {
 				fmt.Println("invalid selection")
 				continue
 			}
-			if err := store.Archive(view[n-1].ID); err != nil {
+			if err := store.Archive(pageRows[n-1].Entry.ID); err != nil {
 				fmt.Printf("archive failed: %v\n", err)
 			}
 			continue
 		}
 
 		n, err := strconv.Atoi(cmd)
-		if err != nil || n < 1 || n > len(view) {
+		if err != nil || n < 1 || n > len(pageRows) {
 			fmt.Println("invalid selection")
 			continue
 		}
-		if err := store.MarkRead(view[n-1].ID); err != nil {
+		targetID := pageRows[n-1].Entry.ID
+		if err := store.MarkRead(targetID); err != nil {
 			fmt.Printf("mark-read failed: %v\n", err)
 		}
-		if err := printMessageView(store, view[n-1].ID, in); err != nil {
+		if err := printMessageView(store, targetID, in); err != nil {
 			fmt.Printf("open failed: %v\n", err)
 		}
 	}
@@ -579,6 +620,66 @@ func applyInboxFilter(entries []core.MaildirEntry, filter inboxFilter) []core.Ma
 		}
 	}
 	return out
+}
+
+type inboxRow struct {
+	Entry   core.MaildirEntry
+	From    string
+	Subject string
+}
+
+func buildInboxRows(store *maildir.Store, entries []core.MaildirEntry) []inboxRow {
+	out := make([]inboxRow, 0, len(entries))
+	for _, e := range entries {
+		from, subj := readSummary(store, e.ID)
+		out = append(out, inboxRow{
+			Entry:   e,
+			From:    from,
+			Subject: subj,
+		})
+	}
+	return out
+}
+
+func applySearchRows(rows []inboxRow, term string) []inboxRow {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" {
+		return rows
+	}
+	out := make([]inboxRow, 0, len(rows))
+	for _, r := range rows {
+		hay := strings.ToLower(r.Entry.ID + " " + r.From + " " + r.Subject)
+		if strings.Contains(hay, term) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func paginateRows(rows []inboxRow, page, pageSize int) ([]inboxRow, int) {
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	totalPages := (len(rows) + pageSize - 1) / pageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	start := (page - 1) * pageSize
+	if start >= len(rows) {
+		return nil, totalPages
+	}
+	end := start + pageSize
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[start:end], totalPages
 }
 
 func printMessageView(store *maildir.Store, id string, in *bufio.Reader) error {

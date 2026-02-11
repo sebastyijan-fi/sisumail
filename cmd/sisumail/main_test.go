@@ -77,3 +77,36 @@ func TestApplyInboxFilter(t *testing.T) {
 		t.Fatalf("unread: got %d, want 2", len(got))
 	}
 }
+
+func TestApplySearchRows(t *testing.T) {
+	rows := []inboxRow{
+		{Entry: core.MaildirEntry{ID: "id-1"}, From: "alice@example.com", Subject: "hello"},
+		{Entry: core.MaildirEntry{ID: "id-2"}, From: "bob@example.com", Subject: "status"},
+	}
+
+	if got := applySearchRows(rows, "alice"); len(got) != 1 {
+		t.Fatalf("search alice: got %d, want 1", len(got))
+	}
+	if got := applySearchRows(rows, "ID-2"); len(got) != 1 {
+		t.Fatalf("search id-2: got %d, want 1", len(got))
+	}
+	if got := applySearchRows(rows, ""); len(got) != 2 {
+		t.Fatalf("search empty: got %d, want 2", len(got))
+	}
+}
+
+func TestPaginateRows(t *testing.T) {
+	rows := make([]inboxRow, 0, 5)
+	for i := 0; i < 5; i++ {
+		rows = append(rows, inboxRow{Entry: core.MaildirEntry{ID: string(rune('a' + i))}})
+	}
+
+	page1, total := paginateRows(rows, 1, 2)
+	if total != 3 || len(page1) != 2 {
+		t.Fatalf("page1: total=%d len=%d", total, len(page1))
+	}
+	page3, total := paginateRows(rows, 3, 2)
+	if total != 3 || len(page3) != 1 {
+		t.Fatalf("page3: total=%d len=%d", total, len(page3))
+	}
+}
