@@ -7,10 +7,14 @@
 ## Abstract
 Sisumail is a receive-only email identity system where a user's SSH key is the sole credential: it authenticates access, binds identity, and derives encryption keys. Sisumail's primary delivery path (Tier 1) is a blind Layer-4 relay that routes inbound SMTP by destination IPv6 address and never terminates TLS; after STARTTLS, the relay cannot decrypt message headers or bodies because the TLS session terminates on the user's device. For compatibility with IPv4-only senders and optional offline delivery, Sisumail provides Tier 2 "encrypted spool" fallback: the relay terminates SMTP/TLS, sees plaintext transiently during ingest, encrypts the full RFC 5322 message immediately to the user's key, and stores or streams ciphertext only. Every message is labeled with the tier used, so the security properties are testable and user-visible.
 
+Sisumail is not trying to replace conversational email workflows. It is a sovereign receive-only identity mailbox for the internet's account-creation and account-recovery ceremony: verification links, password resets, 2FA fallback codes, and service notifications.
+
 Sisumail also provides end-to-end encrypted (E2E) user-to-user chat using the same identity keys. The relay routes encrypted blobs but cannot read chat content.
 
 ## 1. Motivation
-Self-hosting email is operationally hard for normal users because it requires:
+Most users do not primarily need a full outbound/inbound email suite for rich conversation. They need a mailbox they cryptographically own for registrations, verifications, recovery flows, and notifications across internet services.
+
+Operating a trustworthy mailbox identity is still hard because traditional self-hosting requires:
 
 - stable IP reputation and deliverability infrastructure
 - always-on availability
@@ -36,7 +40,7 @@ At the same time, centralized email providers necessarily terminate TLS and proc
 ### 2.2 Non-Goals (v1)
 - Outbound email (Sisumail is receive-only).
 - Universal deliverability under strict TLS requirements (legacy MTAs may fail).
-- Webmail UX (terminal-first).
+- A single mandated interface. Sisumail is terminal-native in v1, but interface-agnostic by design.
 - Global privacy against metadata analysis (the relay still sees timing, size, and routing metadata).
 
 ## 3. High-Level System
@@ -51,6 +55,8 @@ Users interact via SSH:
 ```bash
 ssh <username>@sisumail.fi
 ```
+
+SSH is the protocol/authentication layer, not a UX limitation. Third-party clients (mobile, desktop, web) can implement richer interfaces while using SSH keys and channel semantics under the hood.
 
 Two usage modes share the same identity:
 
