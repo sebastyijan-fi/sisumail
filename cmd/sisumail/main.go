@@ -181,7 +181,15 @@ func main() {
 		}
 	}
 
-	res, err := provider.GetCertificate(time.Now())
+	var res tlsboot.CertResult
+	if acmePrimary != nil {
+		start := time.Now()
+		log.Printf("acme: bootstrap start host=%s via_relay=%v directory=%s", host, *acmeViaRelay, defaultIfEmpty(strings.TrimSpace(*acmeDirectoryURL), "letsencrypt-production"))
+		res, err = provider.GetCertificate(time.Now())
+		log.Printf("acme: bootstrap done in %s source=%s authenticated_ca=%v err=%v", time.Since(start).Round(time.Second), res.Source, res.AuthenticatedCA, err)
+	} else {
+		res, err = provider.GetCertificate(time.Now())
+	}
 	if err != nil {
 		log.Fatalf("tls bootstrap (%s): %v", pol, err)
 	}
@@ -393,6 +401,13 @@ func certFingerprint(cert tls.Certificate) string {
 	}
 	sum := sha256.Sum256(cert.Certificate[0])
 	return hex.EncodeToString(sum[:])
+}
+
+func defaultIfEmpty(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Store) {
