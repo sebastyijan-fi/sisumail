@@ -20,3 +20,7 @@ maildir = "~/.local/share/sisumail/maildir"
 # - pragmatic: allow temporary self-signed for encryption, label auth separately
 bootstrap_policy = "pragmatic"
 
+# Optional ACME DNS-01 automation (requires HCLOUD_TOKEN in environment):
+# acme_dns01 = true
+# zone = "sisumail.fi"
+# acme_email = "you@example.com"

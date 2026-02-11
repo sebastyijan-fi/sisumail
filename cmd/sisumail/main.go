@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net/mail"
 	"net"
+	"net/mail"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,10 +24,11 @@ import (
 
 	"github.com/emersion/go-smtp"
 	"github.com/sisumail/sisumail/internal/core"
+	"github.com/sisumail/sisumail/internal/dns/hetznercloud"
+	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/store/chatlog"
 	"github.com/sisumail/sisumail/internal/store/knownkeys"
 	"github.com/sisumail/sisumail/internal/store/maildir"
-	"github.com/sisumail/sisumail/internal/proto"
 	"github.com/sisumail/sisumail/internal/tier2"
 	"github.com/sisumail/sisumail/internal/tlsboot"
 	"golang.org/x/crypto/ssh"
@@ -33,24 +36,33 @@ import (
 
 func main() {
 	var (
-		relayAddr  = flag.String("relay", "127.0.0.1:2222", "relay SSH address (dev default 127.0.0.1:2222)")
-		user       = flag.String("user", "niklas", "sisumail username")
-		keyPath    = flag.String("key", filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"), "ssh private key path")
-		smtpListen = flag.String("smtp-listen", "127.0.0.1:2526", "local SMTP daemon listen address")
-		tlsPolicy  = flag.String("tls-policy", "pragmatic", "tls bootstrap policy: pragmatic|strict")
-		certPath   = flag.String("tls-cert", "", "path to TLS cert PEM (optional; ACME will populate later)")
-		keyPemPath = flag.String("tls-key", "", "path to TLS key PEM (optional; ACME will populate later)")
-		maildirRoot = flag.String("maildir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "maildir"), "local Maildir root")
-		inboxMode  = flag.Bool("inbox", false, "list local inbox and exit")
-		readID     = flag.String("read-id", "", "read local message by ID and exit")
-		tuiMode    = flag.Bool("tui", false, "interactive local inbox view")
-		chatTo     = flag.String("chat-to", "", "send encrypted chat message to username (relay session must be online)")
-		chatMsg    = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
-		chatWith   = flag.String("chat-with", "", "interactive chat session with username")
-		chatDir    = flag.String("chat-dir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "chat"), "local chat history directory")
-		knownKeysPath = flag.String("known-keys", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "known_keys.json"), "pinned peer key fingerprints")
-		chatHistory = flag.String("chat-history", "", "print chat history with username and exit")
-		chatLimit  = flag.Int("chat-limit", 100, "max chat history lines for -chat-history (0 = unlimited)")
+		relayAddr           = flag.String("relay", "127.0.0.1:2222", "relay SSH address (dev default 127.0.0.1:2222)")
+		user                = flag.String("user", "niklas", "sisumail username")
+		zone                = flag.String("zone", "sisumail.fi", "root zone name")
+		keyPath             = flag.String("key", filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"), "ssh private key path")
+		smtpListen          = flag.String("smtp-listen", "127.0.0.1:2526", "local SMTP daemon listen address")
+		tlsPolicy           = flag.String("tls-policy", "pragmatic", "tls bootstrap policy: pragmatic|strict")
+		certPath            = flag.String("tls-cert", "", "path to TLS cert PEM (optional; ACME will populate later)")
+		keyPemPath          = flag.String("tls-key", "", "path to TLS key PEM (optional; ACME will populate later)")
+		acmeDNS01Enabled    = flag.Bool("acme-dns01", false, "enable ACME DNS-01 certificate automation")
+		acmeDirectoryURL    = flag.String("acme-directory-url", "", "ACME directory URL (default: Let's Encrypt production)")
+		acmeEmail           = flag.String("acme-email", "", "optional ACME account email")
+		acmeAccountKeyPath  = flag.String("acme-account-key", "", "path to ACME account key PEM")
+		acmeRenewBefore     = flag.Duration("acme-renew-before", 30*24*time.Hour, "renew cert when expiry is within this duration")
+		acmeCheckInterval   = flag.Duration("acme-check-interval", 6*time.Hour, "periodic ACME renewal check interval")
+		acmePropagationWait = flag.Duration("acme-propagation-wait", 20*time.Second, "wait after DNS-01 TXT upsert before validation")
+		acmeIssueTimeout    = flag.Duration("acme-issue-timeout", 4*time.Minute, "timeout for a single ACME issue/renew attempt")
+		maildirRoot         = flag.String("maildir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "maildir"), "local Maildir root")
+		inboxMode           = flag.Bool("inbox", false, "list local inbox and exit")
+		readID              = flag.String("read-id", "", "read local message by ID and exit")
+		tuiMode             = flag.Bool("tui", false, "interactive local inbox view")
+		chatTo              = flag.String("chat-to", "", "send encrypted chat message to username (relay session must be online)")
+		chatMsg             = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
+		chatWith            = flag.String("chat-with", "", "interactive chat session with username")
+		chatDir             = flag.String("chat-dir", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "chat"), "local chat history directory")
+		knownKeysPath       = flag.String("known-keys", filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "known_keys.json"), "pinned peer key fingerprints")
+		chatHistory         = flag.String("chat-history", "", "print chat history with username and exit")
+		chatLimit           = flag.Int("chat-limit", 100, "max chat history lines for -chat-history (0 = unlimited)")
 	)
 	flag.Parse()
 	if *tuiMode && strings.TrimSpace(*chatWith) != "" {
@@ -88,9 +100,42 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	host := fmt.Sprintf("v6.%s.sisumail.fi", *user)
+	host := fmt.Sprintf("v6.%s.%s", *user, strings.TrimSuffix(*zone, "."))
+	if *acmeDNS01Enabled {
+		defaultDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "sisumail", "tls")
+		if strings.TrimSpace(*certPath) == "" {
+			*certPath = filepath.Join(defaultDir, host+".crt.pem")
+		}
+		if strings.TrimSpace(*keyPemPath) == "" {
+			*keyPemPath = filepath.Join(defaultDir, host+".key.pem")
+		}
+		if strings.TrimSpace(*acmeAccountKeyPath) == "" {
+			*acmeAccountKeyPath = filepath.Join(defaultDir, "acme-account.pem")
+		}
+	}
+
 	var primary tlsboot.Provider
-	if *certPath != "" && *keyPemPath != "" {
+	var acmePrimary *tlsboot.ACMEDNS01Provider
+	if *acmeDNS01Enabled {
+		token := loadHCloudToken()
+		if strings.TrimSpace(token) == "" {
+			log.Fatalf("acme dns-01 requires HCLOUD_TOKEN or HETZNER_CLOUD_TOKEN")
+		}
+		acmePrimary = &tlsboot.ACMEDNS01Provider{
+			Hostname:        host,
+			ZoneName:        strings.TrimSuffix(*zone, "."),
+			Email:           strings.TrimSpace(*acmeEmail),
+			DirectoryURL:    strings.TrimSpace(*acmeDirectoryURL),
+			DNSProvider:     hetznercloud.NewClient(token, strings.TrimSuffix(*zone, ".")),
+			CertPath:        *certPath,
+			KeyPath:         *keyPemPath,
+			AccountKeyPath:  *acmeAccountKeyPath,
+			RenewBefore:     *acmeRenewBefore,
+			PropagationWait: *acmePropagationWait,
+			IssueTimeout:    *acmeIssueTimeout,
+		}
+		primary = acmePrimary
+	} else if *certPath != "" && *keyPemPath != "" {
 		primary = &tlsboot.DiskProvider{CertPath: *certPath, KeyPath: *keyPemPath}
 	}
 	pol := tlsboot.ParsePolicy(*tlsPolicy)
@@ -100,8 +145,8 @@ func main() {
 		provider = &tlsboot.StrictProvider{Primary: primary}
 	default:
 		provider = &tlsboot.PragmaticProvider{
-			Hostnames:         []string{host, "localhost"},
-			Primary:           primary,
+			Hostnames:          []string{host, "localhost"},
+			Primary:            primary,
 			SelfSignedValidity: 24 * time.Hour,
 		}
 	}
@@ -114,8 +159,17 @@ func main() {
 		log.Fatalf("tls bootstrap (%s): no certificate available", pol)
 	}
 
-	tlsCfg := &tls.Config{Certificates: []tls.Certificate{res.Cert}}
+	certState := newTLSCertState(res.Cert)
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return certState.Get(), nil
+		},
+	}
 	log.Printf("tls: source=%s authenticated_ca=%v", res.Source, res.AuthenticatedCA)
+	if acmePrimary != nil && *acmeCheckInterval > 0 {
+		go runACMERenewLoop(ctx, acmePrimary, certState, *acmeCheckInterval)
+	}
 
 	// Start local SMTP daemon.
 	bridge := newDeliveryMetaBridge()
@@ -253,6 +307,86 @@ func handleChannel(ch ssh.NewChannel, smtpListen string, bridge *deliveryMetaBri
 	go func() { _, _ = io.Copy(local, channel); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(channel, local); done <- struct{}{} }()
 	<-done
+}
+
+func runACMERenewLoop(ctx context.Context, p *tlsboot.ACMEDNS01Provider, state *tlsCertState, interval time.Duration) {
+	if p == nil || state == nil || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			res, err := p.GetCertificate(time.Now())
+			if err != nil {
+				log.Printf("acme renew: %v", err)
+				continue
+			}
+			if !res.Encrypted {
+				log.Printf("acme renew: no certificate available")
+				continue
+			}
+			if state.SetIfChanged(res.Cert) {
+				log.Printf("acme renew: certificate updated (source=%s authenticated_ca=%v)", res.Source, res.AuthenticatedCA)
+			}
+		}
+	}
+}
+
+func loadHCloudToken() string {
+	if tok := strings.TrimSpace(os.Getenv("HCLOUD_TOKEN")); tok != "" {
+		return tok
+	}
+	return strings.TrimSpace(os.Getenv("HETZNER_CLOUD_TOKEN"))
+}
+
+type tlsCertState struct {
+	mu          sync.RWMutex
+	cert        tls.Certificate
+	fingerprint string
+}
+
+func newTLSCertState(cert tls.Certificate) *tlsCertState {
+	s := &tlsCertState{}
+	s.set(cert)
+	return s
+}
+
+func (s *tlsCertState) Get() *tls.Certificate {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c := s.cert
+	return &c
+}
+
+func (s *tlsCertState) SetIfChanged(cert tls.Certificate) bool {
+	fp := certFingerprint(cert)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fp == s.fingerprint && fp != "" {
+		return false
+	}
+	s.cert = cert
+	s.fingerprint = fp
+	return true
+}
+
+func (s *tlsCertState) set(cert tls.Certificate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cert = cert
+	s.fingerprint = certFingerprint(cert)
+}
+
+func certFingerprint(cert tls.Certificate) string {
+	if len(cert.Certificate) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(cert.Certificate[0])
+	return hex.EncodeToString(sum[:])
 }
 
 func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Store) {
@@ -520,7 +654,7 @@ func (s *localSession) Data(r io.Reader) error {
 	}
 	return nil
 }
-func (s *localSession) Reset() {}
+func (s *localSession) Reset()        {}
 func (s *localSession) Logout() error { return nil }
 
 type deliveryMetaBridge struct {

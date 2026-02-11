@@ -12,7 +12,7 @@ Working today (local harness + current relay):
 - Identity registry (SQLite) with first-come claim semantics and per-user IPv6 allocation from a /64.
 
 Not working yet / not complete (do not assume production-ready):
-- ACME DNS-01 certificate issuance for Tier 1 device certificates (control channel not implemented).
+- Relay-mediated ACME control channel is not implemented yet (client-side DNS-01 automation is available).
 - DANE/DNSSEC and MTA-STS hardening.
 - Full production alerting/SLO dashboard integration is not complete yet (basic health/readiness/metrics endpoints are available).
 - Production port plan (moving product SSH to `:22` safely while keeping admin OpenSSH access).
@@ -34,6 +34,15 @@ go run ./cmd/sisumail-relay -ssh-listen :2222 -tier1-listen :2525 -dev-user nikl
 In another terminal:
 ```bash
 go run ./cmd/sisumail -relay 127.0.0.1:2222 -user niklas -key ~/.ssh/id_ed25519 -smtp-listen 127.0.0.1:2526 -tls-policy pragmatic
+
+# Enable ACME DNS-01 automation (Hetzner DNS token via HCLOUD_TOKEN env).
+go run ./cmd/sisumail \
+  -relay 127.0.0.1:2222 \
+  -user niklas \
+  -key ~/.ssh/id_ed25519 \
+  -zone sisumail.fi \
+  -tls-policy strict \
+  -acme-dns01
 ```
 
 ### 3) Simulate a sender delivering SMTP to Tier 1
@@ -54,5 +63,5 @@ For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-
 Near-term build targets (in order):
 - Production observability: health checks, metrics, alert thresholds, and runbooks.
 - Tier 2 abuse tuning and automation (denylist maintenance process + adaptive policies).
-- ACME DNS-01 issuance flow for Tier 1 node certificates.
+- Relay-mediated ACME control channel (replace direct token-on-node flow).
 - Node mode packaging and onboarding polish.

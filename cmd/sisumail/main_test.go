@@ -8,6 +8,7 @@ import (
 
 	"github.com/sisumail/sisumail/internal/core"
 	"github.com/sisumail/sisumail/internal/proto"
+	"github.com/sisumail/sisumail/internal/tlsboot"
 )
 
 func TestInjectSisumailHeaders(t *testing.T) {
@@ -145,5 +146,35 @@ func TestParseChatSendCommand(t *testing.T) {
 	}
 	if _, _, ok := parseChatSendCommand("c "); ok {
 		t.Fatal("expected parse failure with empty command")
+	}
+}
+
+func TestTLSCertStateSetIfChanged(t *testing.T) {
+	c1, err := tlsboot.SelfSigned([]string{"a.example"}, time.Hour)
+	if err != nil {
+		t.Fatalf("SelfSigned c1: %v", err)
+	}
+	c2, err := tlsboot.SelfSigned([]string{"b.example"}, time.Hour)
+	if err != nil {
+		t.Fatalf("SelfSigned c2: %v", err)
+	}
+	s := newTLSCertState(c1)
+	if s.SetIfChanged(c1) {
+		t.Fatal("expected unchanged certificate to be ignored")
+	}
+	if !s.SetIfChanged(c2) {
+		t.Fatal("expected changed certificate to be accepted")
+	}
+	got := s.Get()
+	if got == nil || len(got.Certificate) == 0 {
+		t.Fatal("expected current certificate")
+	}
+}
+
+func TestLoadHCloudTokenPrefersPrimaryVar(t *testing.T) {
+	t.Setenv("HCLOUD_TOKEN", "primary")
+	t.Setenv("HETZNER_CLOUD_TOKEN", "fallback")
+	if got := loadHCloudToken(); got != "primary" {
+		t.Fatalf("loadHCloudToken got %q, want primary", got)
 	}
 }
