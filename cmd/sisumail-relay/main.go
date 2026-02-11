@@ -375,6 +375,9 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					execLike := pollSessionRequests(reqs, 150*time.Millisecond)
 					status := uint32(0)
 					if !execLike {
+						go func() {
+							handleSessionRequests(reqs)
+						}()
 						status = runHostedShell(c, hostedShellEnv{
 							username:       user,
 							source:         source,
@@ -619,6 +622,12 @@ func handleSessionRequest(req *ssh.Request) (execLike bool) {
 		_ = req.Reply(allow, nil)
 	}
 	return isExecLike
+}
+
+func handleSessionRequests(reqs <-chan *ssh.Request) {
+	for req := range reqs {
+		_ = handleSessionRequest(req)
+	}
 }
 
 func sessionRequestAllowed(reqType string) (allow bool, execLike bool) {
