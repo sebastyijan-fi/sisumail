@@ -125,6 +125,7 @@ See `docs/dns-records.md` for the exact per-user record templates.
 
 For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-runbook.md`.
 For real relay-mediated ACME verification on an operator host, use `scripts/smoke_acme_relay_live.sh`.
+For hosted SSH UX verification on a real claimed user, use `scripts/smoke_hosted_shell_live.sh`.
 Latest live dogfooding findings are tracked in `docs/dogfood-notes-2026-02-11.md`.
 Access-mode trust differences are documented in `docs/access-modes.md`.
 

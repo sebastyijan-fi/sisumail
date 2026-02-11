@@ -230,6 +230,12 @@ Live ACME relay smoke test (staging CA by default):
 scripts/smoke_acme_relay_live.sh
 ```
 
+Live hosted SSH shell smoke test (requires claimed user key):
+
+```bash
+SSH_USER=<claimed_user> scripts/smoke_hosted_shell_live.sh
+```
+
 Optional overrides:
 - `ACME_DIR` (default Let’s Encrypt staging)
 - `RELAY_ADDR`, `SMTP_LISTEN`, `ZONE`, `PROP_WAIT`, `TIMEOUT_SECS`
