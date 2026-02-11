@@ -118,6 +118,9 @@ ExecStart=/bin/sh -c '/usr/local/bin/sisumail-tier2 \
   -db /var/lib/sisumail/relay.db \
   -spool-dir /var/spool/sisumail \
   -tls-mode "${SISUMAIL_TIER2_TLS_MODE:-opportunistic}" \
+  -denylist-path "${SISUMAIL_TIER2_DENYLIST_PATH:-}" \
+  -max-conns-per-source "${SISUMAIL_TIER2_MAX_CONNS_PER_SOURCE:-20}" \
+  -max-msgs-per-source-per-min "${SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN:-60}" \
   -tls-cert "${SISUMAIL_TIER2_TLS_CERT:-}" \
   -tls-key "${SISUMAIL_TIER2_TLS_KEY:-}"'
 Restart=always
@@ -223,6 +226,9 @@ ensure_env_file() {
 # SISUMAIL_TIER2_LISTEN: Tier 2 SMTP bind (staging default 127.0.0.1:2526, production :25)
 # SISUMAIL_TIER2_TLS_MODE: disable|opportunistic|required (production: required)
 # SISUMAIL_TIER2_TLS_CERT / SISUMAIL_TIER2_TLS_KEY: cert/key for spool.<zone> STARTTLS
+# SISUMAIL_TIER2_DENYLIST_PATH: optional file of blocked source IP/CIDR entries
+# SISUMAIL_TIER2_MAX_CONNS_PER_SOURCE: per-source concurrent SMTP connection cap
+# SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN: per-source accepted message cap per minute
 # SISUMAIL_OBS_LISTEN: local observability endpoint, e.g. 127.0.0.1:9090
 # SISUMAIL_TIER1_*: Tier 1 hardening controls.
 HCLOUD_TOKEN=
@@ -232,6 +238,9 @@ SISUMAIL_TIER2_LISTEN=127.0.0.1:2526
 SISUMAIL_TIER2_TLS_MODE=opportunistic
 SISUMAIL_TIER2_TLS_CERT=
 SISUMAIL_TIER2_TLS_KEY=
+SISUMAIL_TIER2_DENYLIST_PATH=
+SISUMAIL_TIER2_MAX_CONNS_PER_SOURCE=20
+SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN=60
 SISUMAIL_OBS_LISTEN=127.0.0.1:9090
 SISUMAIL_TIER1_FAST_FAIL_MS=200
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000

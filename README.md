@@ -53,6 +53,6 @@ For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-
 ## Next
 Near-term build targets (in order):
 - Production observability: health checks, metrics, alert thresholds, and runbooks.
-- Abuse controls beyond channel limits (SMTP ingress policies for Tier 2 and operator ban workflows).
+- Tier 2 abuse tuning and automation (denylist maintenance process + adaptive policies).
 - ACME DNS-01 issuance flow for Tier 1 node certificates.
 - Node mode packaging and onboarding polish.

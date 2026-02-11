@@ -21,14 +21,17 @@ import (
 
 func main() {
 	var (
-		listen   = flag.String("listen", ":2526", "Tier 2 SMTP listen address (staging default :2526)")
-		zone     = flag.String("zone", "", "root zone name, e.g. sisumail.fi (required)")
-		dbPath   = flag.String("db", "/var/lib/sisumail/relay.db", "identity database path (shared with relay)")
-		spoolDir = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root")
-		maxBytes = flag.Int64("max-bytes", 25<<20, "max message size in bytes (0 = unlimited)")
-		certPath = flag.String("tls-cert", "", "TLS cert PEM for STARTTLS (recommended for real MX)")
-		keyPath  = flag.String("tls-key", "", "TLS key PEM for STARTTLS (recommended for real MX)")
-		tlsMode  = flag.String("tls-mode", "opportunistic", "TLS mode: disable|opportunistic|required")
+		listen                 = flag.String("listen", ":2526", "Tier 2 SMTP listen address (staging default :2526)")
+		zone                   = flag.String("zone", "", "root zone name, e.g. sisumail.fi (required)")
+		dbPath                 = flag.String("db", "/var/lib/sisumail/relay.db", "identity database path (shared with relay)")
+		spoolDir               = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root")
+		maxBytes               = flag.Int64("max-bytes", 25<<20, "max message size in bytes (0 = unlimited)")
+		certPath               = flag.String("tls-cert", "", "TLS cert PEM for STARTTLS (recommended for real MX)")
+		keyPath                = flag.String("tls-key", "", "TLS key PEM for STARTTLS (recommended for real MX)")
+		tlsMode                = flag.String("tls-mode", "opportunistic", "TLS mode: disable|opportunistic|required")
+		denylistPath           = flag.String("denylist-path", "", "path to source-IP denylist file (IP/CIDR per line)")
+		maxConnsPerSource      = flag.Int("max-conns-per-source", 20, "max concurrent SMTP connections per source IP (0 disables)")
+		maxMsgsPerSourcePerMin = flag.Int("max-msgs-per-source-per-min", 60, "max accepted messages per source IP per minute (0 disables)")
 	)
 	flag.Parse()
 
@@ -40,6 +43,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid -tls-mode: %v", err)
 	}
+	denylist, err := tier2.ParseDenylist(*denylistPath)
+	if err != nil {
+		log.Fatalf("parse -denylist-path: %v", err)
+	}
+	guard := tier2.NewSourceGuard(*maxConnsPerSource, *maxMsgsPerSourcePerMin, denylist)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -67,6 +75,7 @@ func main() {
 		Domain:      *zone,
 		MaxSize:     *maxBytes,
 		RequireTLS:  mode == tlsModeRequired,
+		Guard:       guard,
 	}
 
 	srv := smtp.NewServer(backend)
@@ -107,7 +116,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("tier2: listening on %s (zone=%s spool=%s)", *listen, *zone, *spoolDir)
+		log.Printf("tier2: listening on %s (zone=%s spool=%s denylist_entries=%d conn_cap=%d msg_rate_per_min=%d)",
+			*listen, *zone, *spoolDir, len(denylist), *maxConnsPerSource, *maxMsgsPerSourcePerMin)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("tier2: server error: %v", err)
 			cancel()

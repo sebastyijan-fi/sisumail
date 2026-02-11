@@ -102,6 +102,9 @@ SISUMAIL_TIER2_LISTEN=127.0.0.1:2526   # staging default; set to :25 for product
 SISUMAIL_TIER2_TLS_MODE=opportunistic  # disable|opportunistic|required (production: required)
 SISUMAIL_TIER2_TLS_CERT=               # path to cert PEM for spool.<zone>
 SISUMAIL_TIER2_TLS_KEY=                # path to key PEM for spool.<zone>
+SISUMAIL_TIER2_DENYLIST_PATH=/etc/sisumail-tier2-denylist.txt
+SISUMAIL_TIER2_MAX_CONNS_PER_SOURCE=20
+SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN=60
 SISUMAIL_OBS_LISTEN=127.0.0.1:9090     # relay health/readiness/metrics HTTP
 SISUMAIL_TIER1_FAST_FAIL_MS=200        # quick offline failover to MX 20
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000    # SSH smtp-delivery channel open timeout
@@ -190,6 +193,15 @@ curl -fsS http://127.0.0.1:9090/metrics | head
 ```
 
 `/-/readyz` returns `503` until both SSH gateway and Tier 1 listeners are active.
+
+Tier 2 denylist file format (`SISUMAIL_TIER2_DENYLIST_PATH`):
+
+```text
+# one entry per line (IP or CIDR)
+203.0.113.10
+198.51.100.0/24
+2001:db8:bad::/48
+```
 
 ## 10) Production Cutover (Later)
 

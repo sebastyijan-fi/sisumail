@@ -115,3 +115,74 @@ func TestReceiverRequiresTLS(t *testing.T) {
 		t.Fatalf("expected SMTP 530, got %d", smtpErr.Code)
 	}
 }
+
+func TestReceiverRateLimitsMessagesBySource(t *testing.T) {
+	pub, _ := genTestKeyPair(t)
+	spool := &FileSpool{Root: t.TempDir()}
+	guard := NewSourceGuard(10, 1, nil)
+	rcv := &Receiver{
+		KeyResolver: &staticResolver{domain: "niklas.sisumail.fi", key: pub},
+		Spool:       spool,
+		Domain:      "sisumail.fi",
+		Guard:       guard,
+	}
+
+	sessAny, err := rcv.NewSession(nil)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sess := sessAny.(*session)
+	defer sess.Logout()
+
+	if err := sess.Mail("sender@example.com", nil); err != nil {
+		t.Fatalf("Mail: %v", err)
+	}
+	if err := sess.Rcpt("mail@niklas.sisumail.fi", nil); err != nil {
+		t.Fatalf("Rcpt: %v", err)
+	}
+	if err := sess.Data(strings.NewReader("Subject: 1\r\n\r\nok\r\n")); err != nil {
+		t.Fatalf("Data(1): %v", err)
+	}
+	err = sess.Data(strings.NewReader("Subject: 2\r\n\r\nblocked\r\n"))
+	if err == nil {
+		t.Fatal("expected second DATA to be rate-limited")
+	}
+	smtpErr, ok := err.(*gosmtp.SMTPError)
+	if !ok {
+		t.Fatalf("expected SMTPError, got %T", err)
+	}
+	if smtpErr.Code != 451 {
+		t.Fatalf("expected SMTP 451, got %d", smtpErr.Code)
+	}
+}
+
+func TestReceiverReleasesConnBudgetOnLogout(t *testing.T) {
+	pub, _ := genTestKeyPair(t)
+	guard := NewSourceGuard(1, 10, nil)
+	rcv := &Receiver{
+		KeyResolver: &staticResolver{domain: "niklas.sisumail.fi", key: pub},
+		Spool:       &FileSpool{Root: t.TempDir()},
+		Domain:      "sisumail.fi",
+		Guard:       guard,
+	}
+
+	s1Any, err := rcv.NewSession(nil)
+	if err != nil {
+		t.Fatalf("NewSession(1): %v", err)
+	}
+	s1 := s1Any.(*session)
+	_, err = rcv.NewSession(nil)
+	if err == nil {
+		t.Fatal("expected second session to be blocked by conn cap")
+	}
+	smtpErr, ok := err.(*gosmtp.SMTPError)
+	if !ok || smtpErr.Code != 421 {
+		t.Fatalf("expected SMTP 421, got %v (%T)", err, err)
+	}
+	if err := s1.Logout(); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := rcv.NewSession(nil); err != nil {
+		t.Fatalf("expected new session after logout, got: %v", err)
+	}
+}

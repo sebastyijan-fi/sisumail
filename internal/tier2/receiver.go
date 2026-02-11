@@ -9,6 +9,7 @@ package tier2
 import (
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"time"
 
@@ -24,16 +25,56 @@ type Receiver struct {
 	Domain      string // e.g. "sisumail.fi"
 	MaxSize     int64  // max message size in bytes (0 = no limit)
 	RequireTLS  bool   // require STARTTLS before MAIL/RCPT/DATA
+	Guard       *SourceGuard
 }
 
 // NewSession implements smtp.Backend.
 func (r *Receiver) NewSession(conn *gosmtp.Conn) (gosmtp.Session, error) {
-	return &session{receiver: r, conn: conn}, nil
+	s := &session{receiver: r, conn: conn}
+	if conn != nil {
+		if ra := conn.Conn().RemoteAddr(); ra != nil {
+			host, _, err := net.SplitHostPort(ra.String())
+			if err == nil {
+				s.sourceIP = net.ParseIP(host)
+				s.sourceKey = host
+			} else {
+				s.sourceIP = net.ParseIP(ra.String())
+				s.sourceKey = ra.String()
+			}
+		}
+	}
+	if strings.TrimSpace(s.sourceKey) == "" {
+		s.sourceKey = "unknown"
+	}
+	if r.Guard != nil {
+		if r.Guard.IsDenied(s.sourceIP) {
+			if conn != nil {
+				conn.Reject()
+			}
+			return nil, &gosmtp.SMTPError{
+				Code:         554,
+				EnhancedCode: gosmtp.EnhancedCode{5, 7, 1},
+				Message:      "access denied",
+			}
+		}
+		if !r.Guard.TryAcquireConn(s.sourceKey) {
+			return nil, &gosmtp.SMTPError{
+				Code:         421,
+				EnhancedCode: gosmtp.EnhancedCode{4, 7, 0},
+				Message:      "too many connections from source",
+			}
+		}
+		s.acquired = true
+	}
+	return s, nil
 }
 
 type session struct {
 	receiver  *Receiver
 	conn      *gosmtp.Conn
+	sourceIP  net.IP
+	sourceKey string
+	acquired  bool
 	from      string
 	recipient string // the first RCPT TO domain
 	pubKey    string
@@ -132,6 +173,13 @@ func (s *session) Data(r io.Reader) error {
 			Message:      "no recipient set",
 		}
 	}
+	if s.receiver.Guard != nil && !s.receiver.Guard.AllowMessage(s.sourceKey) {
+		return &gosmtp.SMTPError{
+			Code:         451,
+			EnhancedCode: gosmtp.EnhancedCode{4, 7, 1},
+			Message:      "source message rate exceeded, try again later",
+		}
+	}
 
 	// Generate a unique message ID.
 	msgID := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -181,5 +229,9 @@ func (s *session) Reset() {
 }
 
 func (s *session) Logout() error {
+	if s.acquired && s.receiver != nil && s.receiver.Guard != nil {
+		s.receiver.Guard.ReleaseConn(s.sourceKey)
+		s.acquired = false
+	}
 	return nil
 }
