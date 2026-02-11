@@ -1,6 +1,7 @@
 package tier2
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,8 +24,20 @@ type FileSpool struct {
 	Root string // spool root directory
 }
 
+const ageCiphertextHeader = "age-encryption.org/v1\n"
+
 // Put writes ciphertext and metadata atomically.
 func (s *FileSpool) Put(user, msgID string, ciphertext io.Reader, meta core.SpoolMeta) error {
+	// Enforce ciphertext-only storage: Tier 2 spool files must contain age payloads.
+	br := bufio.NewReader(ciphertext)
+	head, err := br.Peek(len(ageCiphertextHeader))
+	if err != nil {
+		return fmt.Errorf("spool validate ciphertext header: %w", err)
+	}
+	if string(head) != ageCiphertextHeader {
+		return fmt.Errorf("spool reject non-age payload")
+	}
+
 	dir := filepath.Join(s.Root, user)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("spool mkdir: %w", err)
@@ -38,7 +51,7 @@ func (s *FileSpool) Put(user, msgID string, ciphertext io.Reader, meta core.Spoo
 		return fmt.Errorf("spool create tmp: %w", err)
 	}
 
-	n, err := io.Copy(f, ciphertext)
+	n, err := io.Copy(f, br)
 	if err != nil {
 		f.Close()
 		os.Remove(ctTmp)

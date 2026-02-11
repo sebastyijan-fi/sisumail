@@ -1,7 +1,9 @@
 package tier2
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +70,22 @@ func TestFileSpoolPutGetRoundTrip(t *testing.T) {
 	if decrypted.String() != plaintext {
 		t.Fatalf("plaintext mismatch:\n  got:  %q\n  want: %q", decrypted.String(), plaintext)
 	}
+
+	ctBytes, err := os.ReadFile(filepath.Join(dir, "niklas", "msg-001.age"))
+	if err != nil {
+		t.Fatalf("read ciphertext: %v", err)
+	}
+	if strings.Contains(string(ctBytes), plaintext) {
+		t.Fatal("ciphertext file contains plaintext")
+	}
+
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "niklas", "msg-001.meta"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	if strings.Contains(string(metaBytes), "Hello.") || strings.Contains(string(metaBytes), "Subject: Test") {
+		t.Fatal("metadata contains message body content")
+	}
 }
 
 func TestFileSpoolAck(t *testing.T) {
@@ -111,6 +129,30 @@ func TestFileSpoolListEmpty(t *testing.T) {
 	}
 }
 
+func TestFileSpoolPutRejectsPlaintextPayload(t *testing.T) {
+	dir := t.TempDir()
+	spool := &FileSpool{Root: dir}
+
+	meta := core.SpoolMeta{
+		MessageID:  "msg-plain",
+		Recipient:  "niklas.sisumail.fi",
+		ReceivedAt: time.Now(),
+		Tier:       "tier2",
+	}
+
+	err := spool.Put("niklas", "msg-plain", strings.NewReader("From: sender@example.com\r\n\r\nhello\r\n"), meta)
+	if err == nil {
+		t.Fatal("expected rejection for non-age payload")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(dir, "niklas", "msg-plain.age")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected no ciphertext file, got stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "niklas", "msg-plain.meta")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected no metadata file, got stat err=%v", statErr)
+	}
+}
+
 // --- helpers ---
 
 type pipeWaiter struct {
@@ -149,4 +191,21 @@ func pipeEncrypt(t *testing.T, plaintext, pubKey string) (*os.File, *pipeWaiter)
 		t.Fatalf("open temp: %v", err)
 	}
 	return f, waiter
+}
+
+func TestFileSpoolPutRejectsShortPayload(t *testing.T) {
+	dir := t.TempDir()
+	spool := &FileSpool{Root: dir}
+
+	meta := core.SpoolMeta{
+		MessageID:  "msg-short",
+		Recipient:  "niklas.sisumail.fi",
+		ReceivedAt: time.Now(),
+		Tier:       "tier2",
+	}
+
+	err := spool.Put("niklas", "msg-short", io.NopCloser(strings.NewReader("abc")), meta)
+	if err == nil {
+		t.Fatal("expected rejection for short payload")
+	}
 }
