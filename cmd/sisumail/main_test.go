@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/mail"
 	"strings"
 	"testing"
 	"time"
@@ -108,5 +109,28 @@ func TestPaginateRows(t *testing.T) {
 	page3, total := paginateRows(rows, 3, 2)
 	if total != 3 || len(page3) != 1 {
 		t.Fatalf("page3: total=%d len=%d", total, len(page3))
+	}
+}
+
+func TestTrustSummary(t *testing.T) {
+	h1 := mail.Header{}
+	h1["X-Sisumail-Sender-Ip"] = []string{"1.2.3.4"}
+	h1["X-Sisumail-Received-At"] = []string{"2026-02-11T00:00:00Z"}
+	if got := trustSummary("tier1", h1); got != "blind+meta" {
+		t.Fatalf("tier1 meta: got %q", got)
+	}
+
+	h2 := mail.Header{}
+	h2["X-Sisumail-Spool-Message-Id"] = []string{"abc"}
+	h2["X-Sisumail-Spool-Size"] = []string{"123"}
+	if got := trustSummary("tier2", h2); got != "spool+proof" {
+		t.Fatalf("tier2 proof: got %q", got)
+	}
+
+	if got := trustSummary("tier1", nil); got != "blind+nometa" {
+		t.Fatalf("tier1 none: got %q", got)
+	}
+	if got := trustSummary("tier2", nil); got != "spool+noproof" {
+		t.Fatalf("tier2 none: got %q", got)
 	}
 }

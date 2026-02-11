@@ -160,7 +160,7 @@ func main() {
 	spoolPump := newSpoolDeliveryPump()
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, reg, spool, spoolPump); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, spoolPump); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -231,7 +231,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -255,11 +255,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg 
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, reg, spool, pump)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, pump)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -289,9 +289,7 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 	// Ignore global requests.
 	go ssh.DiscardRequests(reqs)
 
-	// Minimal dev behavior: accept "session" channels and write a banner, then close.
-	// The important part is that the connection stays open to allow the server to open
-	// "smtp-delivery" channels to the client.
+	// Accept client-opened channels.
 	for {
 		select {
 		case <-ctx.Done():
@@ -301,20 +299,84 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 				return
 			}
 			go func(ch ssh.NewChannel) {
-				if ch.ChannelType() != "session" {
+				switch ch.ChannelType() {
+				case "session":
+					c, reqs, err := ch.Accept()
+					if err != nil {
+						return
+					}
+					go ssh.DiscardRequests(reqs)
+					_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
+					_ = c.Close()
+				case "key-lookup":
+					handleKeyLookupChannel(ch, store)
+				case "chat-send":
+					handleChatSendChannel(ch, user, reg)
+				default:
 					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
 					return
 				}
-				c, reqs, err := ch.Accept()
-				if err != nil {
-					return
-				}
-				go ssh.DiscardRequests(reqs)
-				_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
-				_ = c.Close()
 			}(newCh)
 		}
 	}
+}
+
+func handleKeyLookupChannel(ch ssh.NewChannel, store *identity.Store) {
+	c, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer c.Close()
+
+	if store == nil {
+		_ = proto.WriteKeyLookupResponse(c, "")
+		return
+	}
+	u, err := proto.ReadKeyLookupRequest(c)
+	if err != nil {
+		return
+	}
+	id, err := store.GetByUsername(context.Background(), u)
+	if err != nil || id == nil {
+		_ = proto.WriteKeyLookupResponse(c, "")
+		return
+	}
+	_ = proto.WriteKeyLookupResponse(c, id.PubKeyText)
+}
+
+func handleChatSendChannel(ch ssh.NewChannel, sender string, reg *relay.SessionRegistry) {
+	c, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer c.Close()
+
+	h, br, err := proto.ReadChatSendHeader(c)
+	if err != nil {
+		return
+	}
+	if reg == nil {
+		return
+	}
+	dst, ok := reg.GetSession(h.To)
+	if !ok || dst == nil || dst.Conn == nil {
+		return
+	}
+
+	out, outReqs, err := dst.Conn.OpenChannel("chat-delivery", nil)
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(outReqs)
+	defer out.Close()
+
+	dh := proto.ChatDeliveryHeader{From: sender, SizeBytes: h.SizeBytes}
+	if err := proto.WriteChatDeliveryHeader(out, dh); err != nil {
+		return
+	}
+	_, _ = io.CopyN(out, br, h.SizeBytes)
 }
 
 func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {

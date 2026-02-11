@@ -42,6 +42,8 @@ func main() {
 		inboxMode  = flag.Bool("inbox", false, "list local inbox and exit")
 		readID     = flag.String("read-id", "", "read local message by ID and exit")
 		tuiMode    = flag.Bool("tui", false, "interactive local inbox view")
+		chatTo     = flag.String("chat-to", "", "send encrypted chat message to username (relay session must be online)")
+		chatMsg    = flag.String("chat-msg", "", "chat message text (required with -chat-to)")
 	)
 	flag.Parse()
 
@@ -155,6 +157,26 @@ func main() {
 			go handleSpoolChannel(ch, string(sshKey), store)
 		}
 	}()
+	go func() {
+		chans := client.HandleChannelOpen("chat-delivery")
+		for ch := range chans {
+			go handleChatDeliveryChannel(ch, string(sshKey))
+		}
+	}()
+
+	if strings.TrimSpace(*chatTo) != "" {
+		if strings.TrimSpace(*chatMsg) == "" {
+			log.Fatalf("-chat-msg is required with -chat-to")
+		}
+		if err := sendChat(client, *chatTo, *chatMsg); err != nil {
+			log.Printf("chat send failed: %v", err)
+		} else {
+			log.Printf("chat sent: from=%s to=%s", *user, *chatTo)
+		}
+		if !*tuiMode {
+			cancel()
+		}
+	}
 
 	if *tuiMode {
 		if err := runInboxTUI(store); err != nil {
@@ -242,6 +264,72 @@ func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Sto
 	log.Printf("spool-delivery: stored msg=%s local_id=%s", h.MessageID, id)
 
 	_ = proto.WriteSpoolAck(channel, h.MessageID)
+}
+
+func handleChatDeliveryChannel(ch ssh.NewChannel, sshPrivKey string) {
+	if ch.ChannelType() != "chat-delivery" {
+		_ = ch.Reject(ssh.UnknownChannelType, "unsupported channel")
+		return
+	}
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer channel.Close()
+
+	h, br, err := proto.ReadChatDeliveryHeader(channel)
+	if err != nil {
+		return
+	}
+	lr := io.LimitReader(br, h.SizeBytes)
+	var plain bytes.Buffer
+	if err := tier2.StreamDecrypt(&plain, lr, sshPrivKey); err != nil {
+		log.Printf("chat-delivery: decrypt failed from=%s err=%v", h.From, err)
+		return
+	}
+	log.Printf("chat-delivery: from=%s msg=%q", h.From, strings.TrimSpace(plain.String()))
+}
+
+func sendChat(client *ssh.Client, toUser, message string) error {
+	pubKey, err := lookupUserPubKey(client, toUser)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", toUser, err)
+	}
+	var ct bytes.Buffer
+	if err := tier2.StreamEncrypt(&ct, strings.NewReader(message), pubKey); err != nil {
+		return fmt.Errorf("encrypt: %w", err)
+	}
+
+	ch, reqs, err := client.OpenChannel("chat-send", nil)
+	if err != nil {
+		return err
+	}
+	go ssh.DiscardRequests(reqs)
+	defer ch.Close()
+
+	if err := proto.WriteChatSendHeader(ch, proto.ChatSendHeader{
+		To:        toUser,
+		SizeBytes: int64(ct.Len()),
+	}); err != nil {
+		return err
+	}
+	_, err = io.Copy(ch, &ct)
+	return err
+}
+
+func lookupUserPubKey(client *ssh.Client, username string) (string, error) {
+	ch, reqs, err := client.OpenChannel("key-lookup", nil)
+	if err != nil {
+		return "", err
+	}
+	go ssh.DiscardRequests(reqs)
+	defer ch.Close()
+
+	if err := proto.WriteKeyLookupRequest(ch, username); err != nil {
+		return "", err
+	}
+	return proto.ReadKeyLookupResponse(ch)
 }
 
 type localBackend struct {
@@ -396,14 +484,14 @@ func printInbox(store *maildir.Store) error {
 		fmt.Println("inbox empty")
 		return nil
 	}
-	fmt.Printf("%-30s %-6s %-6s %-20s %s\n", "ID", "TIER", "STATE", "FROM", "SUBJECT")
+	fmt.Printf("%-30s %-6s %-6s %-13s %-20s %s\n", "ID", "TIER", "STATE", "TRUST", "FROM", "SUBJECT")
 	for _, e := range entries {
-		from, subj := readSummary(store, e.ID)
+		sum := readSummaryInfo(store, e.ID, e.Tier)
 		state := "unread"
 		if e.Seen {
 			state = "read"
 		}
-		fmt.Printf("%-30s %-6s %-6s %-20s %s\n", e.ID, strings.ToUpper(e.Tier), state, from, subj)
+		fmt.Printf("%-30s %-6s %-6s %-13s %-20s %s\n", e.ID, strings.ToUpper(e.Tier), state, sum.Trust, sum.From, sum.Subject)
 	}
 	return nil
 }
@@ -422,25 +510,31 @@ func printMessage(store *maildir.Store, id string) error {
 	return nil
 }
 
-func readSummary(store *maildir.Store, id string) (from string, subject string) {
-	from = "-"
-	subject = "-"
+type summaryInfo struct {
+	From    string
+	Subject string
+	Trust   string
+}
+
+func readSummaryInfo(store *maildir.Store, id string, tier string) summaryInfo {
+	sum := summaryInfo{From: "-", Subject: "-", Trust: trustSummary(tier, nil)}
 	rc, err := store.Read(id)
 	if err != nil {
-		return from, subject
+		return sum
 	}
 	defer rc.Close()
 	m, err := mail.ReadMessage(rc)
 	if err != nil {
-		return from, subject
+		return sum
 	}
 	if v := m.Header.Get("From"); v != "" {
-		from = v
+		sum.From = v
 	}
 	if v := m.Header.Get("Subject"); v != "" {
-		subject = v
+		sum.Subject = v
 	}
-	return from, subject
+	sum.Trust = trustSummary(tier, m.Header)
+	return sum
 }
 
 func runInboxTUI(store *maildir.Store) error {
@@ -478,14 +572,14 @@ func runInboxTUI(store *maildir.Store) error {
 		if len(pageRows) == 0 {
 			fmt.Println("(empty)")
 		} else {
-			fmt.Printf("%-4s %-30s %-14s %-7s %-20s %s\n", "NO", "ID", "TIER", "STATE", "FROM", "SUBJECT")
+			fmt.Printf("%-4s %-30s %-14s %-7s %-13s %-20s %s\n", "NO", "ID", "TIER", "STATE", "TRUST", "FROM", "SUBJECT")
 			for i, r := range pageRows {
 				e := r.Entry
 				state := "unread"
 				if e.Seen {
 					state = "read"
 				}
-				fmt.Printf("%-4d %-30s %-14s %-7s %-20s %s\n", i+1, e.ID, tierBadge(e.Tier), state, r.From, r.Subject)
+				fmt.Printf("%-4d %-30s %-14s %-7s %-13s %-20s %s\n", i+1, e.ID, tierBadge(e.Tier), state, r.Trust, r.From, r.Subject)
 			}
 		}
 		fmt.Println()
@@ -626,16 +720,18 @@ type inboxRow struct {
 	Entry   core.MaildirEntry
 	From    string
 	Subject string
+	Trust   string
 }
 
 func buildInboxRows(store *maildir.Store, entries []core.MaildirEntry) []inboxRow {
 	out := make([]inboxRow, 0, len(entries))
 	for _, e := range entries {
-		from, subj := readSummary(store, e.ID)
+		sum := readSummaryInfo(store, e.ID, e.Tier)
 		out = append(out, inboxRow{
 			Entry:   e,
-			From:    from,
-			Subject: subj,
+			From:    sum.From,
+			Subject: sum.Subject,
+			Trust:   sum.Trust,
 		})
 	}
 	return out
@@ -648,7 +744,7 @@ func applySearchRows(rows []inboxRow, term string) []inboxRow {
 	}
 	out := make([]inboxRow, 0, len(rows))
 	for _, r := range rows {
-		hay := strings.ToLower(r.Entry.ID + " " + r.From + " " + r.Subject)
+		hay := strings.ToLower(r.Entry.ID + " " + r.From + " " + r.Subject + " " + r.Trust)
 		if strings.Contains(hay, term) {
 			out = append(out, r)
 		}
@@ -745,6 +841,40 @@ func tierBadge(tier string) string {
 			return "Unknown"
 		}
 		return tier
+	}
+}
+
+func trustSummary(tier string, h mail.Header) string {
+	get := func(k string) string {
+		if h == nil {
+			return ""
+		}
+		return strings.TrimSpace(h.Get(k))
+	}
+
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "tier1":
+		hasIP := get("X-Sisumail-Sender-IP") != ""
+		hasAt := get("X-Sisumail-Received-At") != ""
+		if hasIP && hasAt {
+			return "blind+meta"
+		}
+		if hasIP || hasAt {
+			return "blind+partial"
+		}
+		return "blind+nometa"
+	case "tier2":
+		hasID := get("X-Sisumail-Spool-Message-ID") != ""
+		hasSize := get("X-Sisumail-Spool-Size") != ""
+		if hasID && hasSize {
+			return "spool+proof"
+		}
+		if hasID || hasSize {
+			return "spool+partial"
+		}
+		return "spool+noproof"
+	default:
+		return "unknown"
 	}
 }
 
