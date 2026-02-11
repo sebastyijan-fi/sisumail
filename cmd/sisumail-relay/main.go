@@ -362,16 +362,15 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					if err != nil {
 						return
 					}
-					go func() {
-						for req := range reqs {
-							// Best-effort compatibility for clients expecting shell/pty ack.
-							if req.WantReply {
-								_ = req.Reply(true, nil)
-							}
-						}
-					}()
-					_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
-					_, _ = c.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: 0}))
+					execLike := pollSessionRequests(reqs, 150*time.Millisecond)
+					if !execLike {
+						_, _ = c.Write([]byte("sisumail relay dev gateway (no TUI yet)\n"))
+					}
+					status := uint32(0)
+					if execLike {
+						status = 1
+					}
+					_, _ = c.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: status}))
 					_ = c.Close()
 				case "key-lookup":
 					handleKeyLookupChannel(ch, store, source, chatGuard, stats)
@@ -539,6 +538,60 @@ func handleACMEDNS01Channel(ch ssh.NewChannel, user string, ctrl *acmeDNS01Contr
 	}
 
 	_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: true})
+}
+
+func pollSessionRequests(reqs <-chan *ssh.Request, wait time.Duration) (execLike bool) {
+	if wait <= 0 {
+		wait = 150 * time.Millisecond
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	// First request: wait briefly for common ssh request patterns (exec/shell/pty).
+	select {
+	case req, ok := <-reqs:
+		if ok && handleSessionRequest(req) {
+			execLike = true
+		}
+	case <-timer.C:
+	}
+
+	// Drain any requests that are already queued without blocking.
+	for {
+		select {
+		case req, ok := <-reqs:
+			if !ok {
+				return execLike
+			}
+			if handleSessionRequest(req) {
+				execLike = true
+			}
+		default:
+			return execLike
+		}
+	}
+}
+
+func handleSessionRequest(req *ssh.Request) (execLike bool) {
+	if req == nil {
+		return false
+	}
+	allow, isExecLike := sessionRequestAllowed(req.Type)
+	if req.WantReply {
+		_ = req.Reply(allow, nil)
+	}
+	return isExecLike
+}
+
+func sessionRequestAllowed(reqType string) (allow bool, execLike bool) {
+	switch strings.TrimSpace(strings.ToLower(reqType)) {
+	case "shell", "pty-req", "window-change":
+		return true, false
+	case "exec", "subsystem":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func deliverPendingChat(ctx context.Context, chOpen relay.SSHChannelOpener, user string, q *chatqueue.Store, initialDelay bool, stats *observability.RelayStats) {

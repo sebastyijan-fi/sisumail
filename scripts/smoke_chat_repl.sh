@@ -42,6 +42,7 @@ timeout 12s go run ./cmd/sisumail \
   -relay "127.0.0.1:${SSH_PORT}" \
   -user bob \
   -key "$tmp/bob_key" \
+  -insecure-host-key \
   -smtp-listen "127.0.0.1:${SMTP_PORT_BOB}" \
   -tls-policy pragmatic \
   -chat-dir "$tmp/bob-chat" \
@@ -54,6 +55,7 @@ printf "hello from repl\n/quit\n" | go run ./cmd/sisumail \
   -relay "127.0.0.1:${SSH_PORT}" \
   -user alice \
   -key "$tmp/alice_key" \
+  -insecure-host-key \
   -smtp-listen "127.0.0.1:${SMTP_PORT_ALICE}" \
   -tls-policy pragmatic \
   -chat-dir "$tmp/alice-chat" \

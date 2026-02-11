@@ -60,6 +60,7 @@ timeout 6s go run ./cmd/sisumail \
   -relay "127.0.0.1:${SSH_PORT}" \
   -user alice \
   -key "$tmp/alice_key" \
+  -insecure-host-key \
   -smtp-listen "127.0.0.1:${SMTP_PORT}" \
   -tls-policy pragmatic \
   >"$out" 2>&1

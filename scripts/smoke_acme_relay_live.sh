@@ -91,6 +91,7 @@ timeout "${TIMEOUT_SECS}" /usr/local/bin/sisumail \
   -relay "${RELAY_ADDR}" \
   -user "${u}" \
   -key "${key}" \
+  -insecure-host-key \
   -zone "${ZONE}" \
   -smtp-listen "${SMTP_LISTEN}" \
   -tls-policy strict \

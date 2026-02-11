@@ -32,6 +32,7 @@ import (
 	"github.com/sisumail/sisumail/internal/tier2"
 	"github.com/sisumail/sisumail/internal/tlsboot"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func main() {
@@ -40,6 +41,8 @@ func main() {
 		user                = flag.String("user", "niklas", "sisumail username")
 		zone                = flag.String("zone", "sisumail.fi", "root zone name")
 		keyPath             = flag.String("key", filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"), "ssh private key path")
+		knownHostsPath      = flag.String("known-hosts", filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"), "known_hosts file for relay host key verification")
+		insecureHostKey     = flag.Bool("insecure-host-key", false, "disable relay host key verification (development/testing only)")
 		smtpListen          = flag.String("smtp-listen", "127.0.0.1:2526", "local SMTP daemon listen address")
 		tlsPolicy           = flag.String("tls-policy", "pragmatic", "tls bootstrap policy: pragmatic|strict")
 		certPath            = flag.String("tls-cert", "", "path to TLS cert PEM (optional; ACME will populate later)")
@@ -114,11 +117,15 @@ func main() {
 		log.Fatalf("parse key: %v", err)
 	}
 
+	hostKeyCB, err := buildHostKeyCallback(*insecureHostKey, *knownHostsPath)
+	if err != nil {
+		log.Fatalf("host key callback: %v", err)
+	}
+
 	sshCfg := &ssh.ClientConfig{
-		User: *user,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		// Dev: accept anything; production will pin host keys.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User:            *user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: hostKeyCB,
 		Timeout:         10 * time.Second,
 	}
 
@@ -418,6 +425,25 @@ func defaultIfEmpty(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func buildHostKeyCallback(insecure bool, knownHostsPath string) (ssh.HostKeyCallback, error) {
+	if insecure {
+		log.Printf("WARNING: relay host key verification disabled (-insecure-host-key)")
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+	p := strings.TrimSpace(knownHostsPath)
+	if p == "" {
+		return nil, fmt.Errorf("known_hosts path is empty; set -known-hosts or use -insecure-host-key for dev")
+	}
+	if _, err := os.Stat(p); err != nil {
+		return nil, fmt.Errorf("known_hosts not found at %s", p)
+	}
+	cb, err := knownhosts.New(p)
+	if err != nil {
+		return nil, err
+	}
+	return cb, nil
 }
 
 func handleSpoolChannel(ch ssh.NewChannel, sshPrivKey string, store *maildir.Store) {

@@ -203,3 +203,20 @@ func TestParseShellDirective(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildHostKeyCallbackInsecure(t *testing.T) {
+	cb, err := buildHostKeyCallback(true, "")
+	if err != nil {
+		t.Fatalf("buildHostKeyCallback insecure: %v", err)
+	}
+	if cb == nil {
+		t.Fatal("expected callback")
+	}
+}
+
+func TestBuildHostKeyCallbackMissingFile(t *testing.T) {
+	_, err := buildHostKeyCallback(false, "/nonexistent/known_hosts")
+	if err == nil {
+		t.Fatal("expected error for missing known_hosts")
+	}
+}

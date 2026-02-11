@@ -56,7 +56,7 @@ go run ./cmd/sisumail-relay -ssh-listen :2222 -tier1-listen :2525 -dev-user nikl
 ### 2) Start the client
 In another terminal:
 ```bash
-go run ./cmd/sisumail -relay 127.0.0.1:2222 -user niklas -key ~/.ssh/id_ed25519 -smtp-listen 127.0.0.1:2526 -tls-policy pragmatic
+go run ./cmd/sisumail -relay 127.0.0.1:2222 -user niklas -key ~/.ssh/id_ed25519 -insecure-host-key -smtp-listen 127.0.0.1:2526 -tls-policy pragmatic
 
 # Enable ACME DNS-01 automation via relay control channel (default).
 go run ./cmd/sisumail \
@@ -77,6 +77,8 @@ go run ./cmd/sisumail \
   -acme-dns01 \
   -acme-via-relay=false
 ```
+
+Note: relay host key verification is enabled by default. For local ephemeral dev relays, pass `-insecure-host-key`.
 
 Minimal command shell (chat-first, no heavy TUI):
 
