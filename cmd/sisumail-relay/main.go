@@ -478,24 +478,27 @@ func handleChatSendChannel(ch ssh.NewChannel, sender string, source string, reg 
 	if int64(len(ct)) != h.SizeBytes {
 		return
 	}
-	_ = deliverOrQueueChatCiphertext(sender, h.To, bytes.NewReader(ct), h.SizeBytes, reg, chatSpool, stats)
+	_, err = deliverOrQueueChatCiphertext(sender, h.To, bytes.NewReader(ct), h.SizeBytes, reg, chatSpool, stats)
+	if err != nil {
+		return
+	}
 }
 
-func deliverOrQueueChatCiphertext(sender, to string, payload io.Reader, size int64, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, stats *observability.RelayStats) error {
+func deliverOrQueueChatCiphertext(sender, to string, payload io.Reader, size int64, reg *relay.SessionRegistry, chatSpool *chatqueue.Store, stats *observability.RelayStats) (string, error) {
 	if reg == nil || strings.TrimSpace(to) == "" || payload == nil || size < 0 {
-		return fmt.Errorf("invalid chat delivery args")
+		return "", fmt.Errorf("invalid chat delivery args")
 	}
 	ct, err := io.ReadAll(io.LimitReader(payload, size))
 	if err != nil {
-		return err
+		return "", err
 	}
 	if int64(len(ct)) != size {
-		return fmt.Errorf("chat payload size mismatch")
+		return "", fmt.Errorf("chat payload size mismatch")
 	}
 
-	queue := func() error {
+	queue := func() (string, error) {
 		if chatSpool == nil {
-			return nil
+			return "dropped", nil
 		}
 		id := fmt.Sprintf("%d", time.Now().UnixNano())
 		meta := chatqueue.Meta{
@@ -505,12 +508,12 @@ func deliverOrQueueChatCiphertext(sender, to string, payload io.Reader, size int
 			ReceivedAt: time.Now(),
 		}
 		if err := chatSpool.Put(to, id, bytes.NewReader(ct), meta); err != nil {
-			return err
+			return "", err
 		}
 		if stats != nil {
 			stats.IncChatQueuedOffline()
 		}
-		return nil
+		return "queued-encrypted", nil
 	}
 
 	dst, ok := reg.GetSession(to)
@@ -534,7 +537,7 @@ func deliverOrQueueChatCiphertext(sender, to string, payload io.Reader, size int
 	if stats != nil {
 		stats.IncChatDeliveredLive()
 	}
-	return nil
+	return "delivered-live", nil
 }
 
 func handleACMEDNS01Channel(ch ssh.NewChannel, user string, ctrl *acmeDNS01Controller) {
@@ -742,11 +745,19 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 				_, _ = io.WriteString(ch, "usage: ¤<user> <message>\n")
 				continue
 			}
-			if err := env.sendHostedChat(to, msg); err != nil {
+			mode, err := env.sendHostedChat(to, msg)
+			if err != nil {
 				_, _ = io.WriteString(ch, fmt.Sprintf("send failed: %v\n", err))
 				continue
 			}
-			_, _ = io.WriteString(ch, "sent\n")
+			switch mode {
+			case "delivered-live":
+				_, _ = io.WriteString(ch, "sent (delivered-live)\n")
+			case "queued-encrypted":
+				_, _ = io.WriteString(ch, "queued-encrypted (recipient can decrypt in local/node mode)\n")
+			default:
+				_, _ = io.WriteString(ch, fmt.Sprintf("sent (%s)\n", mode))
+			}
 		default:
 			_, _ = io.WriteString(ch, "unknown command. type ¤help\n")
 		}
@@ -764,30 +775,30 @@ func (env hostedShellEnv) lookup(username string) (*identity.Identity, error) {
 	return env.store.GetByUsername(context.Background(), u)
 }
 
-func (env hostedShellEnv) sendHostedChat(to, message string) error {
+func (env hostedShellEnv) sendHostedChat(to, message string) (string, error) {
 	target, err := env.lookup(to)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if target == nil {
-		return fmt.Errorf("unknown user")
+		return "", fmt.Errorf("unknown user")
 	}
 	if env.guard != nil && (!env.guard.allowSendBySource(env.source) || !env.guard.allowSendByUser(env.username)) {
 		if env.stats != nil {
 			env.stats.IncChatSendLimited()
 		}
-		return fmt.Errorf("rate limited")
+		return "", fmt.Errorf("rate limited")
 	}
 	if env.stats != nil {
 		env.stats.IncChatSendTotal()
 	}
 	var ct bytes.Buffer
 	if err := tier2.StreamEncrypt(&ct, strings.NewReader(message), target.PubKeyText); err != nil {
-		return err
+		return "", err
 	}
 	size := int64(ct.Len())
 	if env.guard != nil && env.guard.maxBytes > 0 && size > env.guard.maxBytes {
-		return fmt.Errorf("message too large")
+		return "", fmt.Errorf("message too large")
 	}
 	return deliverOrQueueChatCiphertext(env.username, target.Username, bytes.NewReader(ct.Bytes()), size, env.reg, env.chatSpool, env.stats)
 }

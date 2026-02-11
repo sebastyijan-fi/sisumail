@@ -109,6 +109,7 @@ Inside shell:
 - `¤chatq`
 - `¤mailq`
 - `¤<user> <message>` to send chat quickly
+  - Output shows delivery mode explicitly: `delivered-live` or `queued-encrypted`.
 
 ### 3) Simulate a sender delivering SMTP to Tier 1
 In a third terminal:
