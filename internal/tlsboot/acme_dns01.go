@@ -178,6 +178,11 @@ func (p *ACMEDNS01Provider) issueOrRenew(now time.Time) error {
 		if cleanup != nil {
 			defer cleanup()
 		}
+		// Give authoritative DNS time to propagate TXT changes before validation,
+		// regardless of whether challenge presentation is local or relay-mediated.
+		if p.PropagationWait > 0 {
+			time.Sleep(p.PropagationWait)
+		}
 
 		if _, err := client.Accept(ctx, ch); err != nil {
 			return fmt.Errorf("acme accept challenge: %w", err)
