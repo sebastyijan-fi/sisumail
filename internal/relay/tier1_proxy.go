@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sisumail/sisumail/internal/proto"
@@ -25,6 +26,20 @@ type Tier1Proxy struct {
 	// FastFail is the max time we allow between accept and abort when the recipient is offline.
 	// Keep this small so MTAs are more likely to try the next MX promptly.
 	FastFail time.Duration
+
+	// Hard limits for Tier 1 ingress.
+	MaxConnsPerUser   int
+	MaxConnsPerSource int
+
+	// Channel open timeout prevents hanging goroutines during SSH channel setup.
+	ChannelOpenTimeout time.Duration
+
+	// IdleTimeout bounds stalled bidirectional pipes.
+	IdleTimeout time.Duration
+
+	mu             sync.Mutex
+	activeByUser   map[string]int
+	activeBySource map[string]int
 }
 
 func (p *Tier1Proxy) Run(ctx context.Context) error {
@@ -33,6 +48,24 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 	}
 	if p.FastFail == 0 {
 		p.FastFail = 200 * time.Millisecond
+	}
+	if p.MaxConnsPerUser <= 0 {
+		p.MaxConnsPerUser = 10
+	}
+	if p.MaxConnsPerSource <= 0 {
+		p.MaxConnsPerSource = 20
+	}
+	if p.ChannelOpenTimeout <= 0 {
+		p.ChannelOpenTimeout = 3 * time.Second
+	}
+	if p.IdleTimeout <= 0 {
+		p.IdleTimeout = 2 * time.Minute
+	}
+	if p.activeByUser == nil {
+		p.activeByUser = make(map[string]int)
+	}
+	if p.activeBySource == nil {
+		p.activeBySource = make(map[string]int)
 	}
 
 	ln := p.Listener
@@ -71,6 +104,17 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 
 	_ = inbound.SetDeadline(time.Now().Add(10 * time.Minute))
 
+	ra, _ := inbound.RemoteAddr().(*net.TCPAddr)
+	source := "unknown"
+	if ra != nil && ra.IP != nil {
+		source = ra.IP.String()
+	}
+	if !p.tryAcquireSource(source) {
+		p.fastFail(inbound)
+		return
+	}
+	defer p.releaseSource(source)
+
 	user := p.DevRouteUser
 	if user == "" {
 		if p.ResolveUser == nil {
@@ -84,31 +128,51 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 		u, ok := p.ResolveUser(la.IP)
 		if !ok {
 			// Unknown dest IP: fail fast.
-			if tc, ok := inbound.(*net.TCPConn); ok {
-				_ = tc.SetLinger(0)
-			}
+			p.fastFail(inbound)
 			return
 		}
 		user = u
 	}
+	if !p.tryAcquireUser(user) {
+		p.fastFail(inbound)
+		return
+	}
+	defer p.releaseUser(user)
 
 	sess, ok := p.Registry.GetSession(user)
 	if !ok {
 		// Fast fail: abort quickly so MTAs attempt alternate MX.
-		if tc, ok := inbound.(*net.TCPConn); ok {
-			// RST on close.
-			_ = tc.SetLinger(0)
-		}
+		p.fastFail(inbound)
 		return
 	}
 
-	ch, _, err := sess.Conn.OpenChannel("smtp-delivery", nil)
-	if err != nil {
+	type openRes struct {
+		ch  io.ReadWriteCloser
+		err error
+	}
+	resCh := make(chan openRes, 1)
+	go func() {
+		ch, _, err := sess.Conn.OpenChannel("smtp-delivery", nil)
+		if err != nil {
+			resCh <- openRes{err: err}
+			return
+		}
+		resCh <- openRes{ch: ch}
+	}()
+
+	var ch io.ReadWriteCloser
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return
+		}
+		ch = res.ch
+	case <-time.After(p.ChannelOpenTimeout):
+		p.fastFail(inbound)
 		return
 	}
 
 	// Preface is out-of-band metadata for the client; do not modify the SMTP byte stream.
-	ra, _ := inbound.RemoteAddr().(*net.TCPAddr)
 	la, _ := inbound.LocalAddr().(*net.TCPAddr)
 	meta := proto.SMTPDeliveryMeta{
 		SenderIP:   ra.IP,
@@ -123,8 +187,91 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 
 	// Bidirectional copy. When one side closes, close the other.
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(ch, inbound); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(inbound, ch); done <- struct{}{} }()
+	go func() { _, _ = copyWithIdleTimeout(ch, inbound, p.IdleTimeout); done <- struct{}{} }()
+	go func() { _, _ = copyWithIdleTimeout(inbound, ch, p.IdleTimeout); done <- struct{}{} }()
 	<-done
 	_ = ch.Close()
+}
+
+func (p *Tier1Proxy) fastFail(inbound net.Conn) {
+	if tc, ok := inbound.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+}
+
+func (p *Tier1Proxy) tryAcquireUser(user string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeByUser[user] >= p.MaxConnsPerUser {
+		return false
+	}
+	p.activeByUser[user]++
+	return true
+}
+
+func (p *Tier1Proxy) releaseUser(user string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.activeByUser[user] - 1
+	if n <= 0 {
+		delete(p.activeByUser, user)
+		return
+	}
+	p.activeByUser[user] = n
+}
+
+func (p *Tier1Proxy) tryAcquireSource(source string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeBySource[source] >= p.MaxConnsPerSource {
+		return false
+	}
+	p.activeBySource[source]++
+	return true
+}
+
+func (p *Tier1Proxy) releaseSource(source string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.activeBySource[source] - 1
+	if n <= 0 {
+		delete(p.activeBySource, source)
+		return
+	}
+	p.activeBySource[source] = n
+}
+
+func copyWithIdleTimeout(dst io.Writer, src io.Reader, idle time.Duration) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+
+	for {
+		if idle > 0 {
+			if rd, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
+				_ = rd.SetReadDeadline(time.Now().Add(idle))
+			}
+		}
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			if idle > 0 {
+				if wd, ok := dst.(interface{ SetWriteDeadline(time.Time) error }); ok {
+					_ = wd.SetWriteDeadline(time.Now().Add(idle))
+				}
+			}
+			nw, ew := dst.Write(buf[:nr])
+			total += int64(nw)
+			if ew != nil {
+				return total, ew
+			}
+			if nw != nr {
+				return total, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return total, nil
+			}
+			return total, er
+		}
+	}
 }

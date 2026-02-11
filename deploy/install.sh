@@ -80,6 +80,11 @@ EnvironmentFile=/etc/sisumail.env
 ExecStart=/usr/local/bin/sisumail-relay \
   -ssh-listen :2222 \
   -tier1-listen :2525 \
+  -tier1-fast-fail-ms "${SISUMAIL_TIER1_FAST_FAIL_MS:-200}" \
+  -tier1-open-timeout-ms "${SISUMAIL_TIER1_OPEN_TIMEOUT_MS:-3000}" \
+  -tier1-idle-timeout-ms "${SISUMAIL_TIER1_IDLE_TIMEOUT_MS:-120000}" \
+  -tier1-max-conns-per-user "${SISUMAIL_TIER1_MAX_CONNS_PER_USER:-10}" \
+  -tier1-max-conns-per-source "${SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE:-20}" \
   -db /var/lib/sisumail/relay.db \
   -hostkey /var/lib/sisumail/hostkey_ed25519
 Restart=always
@@ -97,7 +102,7 @@ EOF
 
   cat > /etc/systemd/system/sisumail-tier2.service <<'EOF'
 [Unit]
-Description=Sisumail Tier 2 Spool (staging port)
+Description=Sisumail Tier 2 Spool
 After=network-online.target
 Wants=network-online.target
 
@@ -105,10 +110,13 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/etc/sisumail.env
 ExecStart=/bin/sh -c '/usr/local/bin/sisumail-tier2 \
-  -listen 127.0.0.1:2526 \
+  -listen "${SISUMAIL_TIER2_LISTEN:-127.0.0.1:2526}" \
   -zone "$SISUMAIL_DNS_ZONE" \
   -db /var/lib/sisumail/relay.db \
-  -spool-dir /var/spool/sisumail'
+  -spool-dir /var/spool/sisumail \
+  -tls-mode "${SISUMAIL_TIER2_TLS_MODE:-opportunistic}" \
+  -tls-cert "${SISUMAIL_TIER2_TLS_CERT:-}" \
+  -tls-key "${SISUMAIL_TIER2_TLS_KEY:-}"'
 Restart=always
 RestartSec=2
 
@@ -209,9 +217,22 @@ ensure_env_file() {
 # HCLOUD_TOKEN: Hetzner Console/Cloud API token (Security -> API tokens)
 # SISUMAIL_DNS_ZONE: your zone name, e.g. sisumail.fi
 # SISUMAIL_IPV6_PREFIX: routed /64 for Tier 1 AnyIP, e.g. 2a01:...::/64
+# SISUMAIL_TIER2_LISTEN: Tier 2 SMTP bind (staging default 127.0.0.1:2526, production :25)
+# SISUMAIL_TIER2_TLS_MODE: disable|opportunistic|required (production: required)
+# SISUMAIL_TIER2_TLS_CERT / SISUMAIL_TIER2_TLS_KEY: cert/key for spool.<zone> STARTTLS
+# SISUMAIL_TIER1_*: Tier 1 hardening controls.
 HCLOUD_TOKEN=
 SISUMAIL_DNS_ZONE=
 SISUMAIL_IPV6_PREFIX=
+SISUMAIL_TIER2_LISTEN=127.0.0.1:2526
+SISUMAIL_TIER2_TLS_MODE=opportunistic
+SISUMAIL_TIER2_TLS_CERT=
+SISUMAIL_TIER2_TLS_KEY=
+SISUMAIL_TIER1_FAST_FAIL_MS=200
+SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000
+SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000
+SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
+SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
 EOF
   chmod 0600 "${ENV_FILE}"
   echo "created ${ENV_FILE} (fill it in, then: systemctl restart sisumail-relay)"

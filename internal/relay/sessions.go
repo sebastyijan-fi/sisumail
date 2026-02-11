@@ -63,3 +63,14 @@ func (r *SessionRegistry) GetSession(username string) (*Session, bool) {
 	s, ok := r.byUser[username]
 	return s, ok
 }
+
+func (r *SessionRegistry) OnlineUsers() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]string, 0, len(r.byUser))
+	for u := range r.byUser {
+		out = append(out, u)
+	}
+	return out
+}

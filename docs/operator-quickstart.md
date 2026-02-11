@@ -99,6 +99,15 @@ cat > /etc/sisumail.env <<EOF
 HCLOUD_TOKEN=...                        # Hetzner Console/Cloud API token (Security -> API token)
 SISUMAIL_DNS_ZONE=<zone>               # e.g. sisumail.fi
 SISUMAIL_IPV6_PREFIX=<relay_ipv6>/64   # your routed /64
+SISUMAIL_TIER2_LISTEN=127.0.0.1:2526   # staging default; set to :25 for production
+SISUMAIL_TIER2_TLS_MODE=opportunistic  # disable|opportunistic|required (production: required)
+SISUMAIL_TIER2_TLS_CERT=               # path to cert PEM for spool.<zone>
+SISUMAIL_TIER2_TLS_KEY=                # path to key PEM for spool.<zone>
+SISUMAIL_TIER1_FAST_FAIL_MS=200        # quick offline failover to MX 20
+SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000    # SSH smtp-delivery channel open timeout
+SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000  # idle TCP/SSH pipe timeout
+SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
+SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
 EOF
 chmod 0600 /etc/sisumail.env
 ```
@@ -177,6 +186,19 @@ Do not do this until Tier 2 + hardening are ready.
 - Bind Tier 1 on port `:25` on IPv6 AnyIP.
 - Run Tier 2 spool MX on `spool.<zone>:25` with a publicly trusted TLS cert for that hostname.
 - Move product SSH to `:22` only after you relocate admin OpenSSH to a different port and verify access.
+
+For Tier 2 cutover with strict STARTTLS:
+
+```bash
+. /etc/sisumail.env
+sed -i 's/^SISUMAIL_TIER2_LISTEN=.*/SISUMAIL_TIER2_LISTEN=:25/' /etc/sisumail.env
+sed -i 's/^SISUMAIL_TIER2_TLS_MODE=.*/SISUMAIL_TIER2_TLS_MODE=required/' /etc/sisumail.env
+# set cert/key paths:
+# SISUMAIL_TIER2_TLS_CERT=/etc/letsencrypt/live/spool.<zone>/fullchain.pem
+# SISUMAIL_TIER2_TLS_KEY=/etc/letsencrypt/live/spool.<zone>/privkey.pem
+systemctl restart sisumail-tier2
+systemctl status sisumail-tier2 --no-pager
+```
 
 ## Operator Safety Notes
 

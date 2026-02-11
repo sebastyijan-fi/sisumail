@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,11 @@ func main() {
 	var (
 		sshListen   = flag.String("ssh-listen", ":2222", "SSH gateway listen address (dev default :2222)")
 		tier1Listen = flag.String("tier1-listen", ":2525", "Tier 1 TCP proxy listen address (dev default :2525)")
+		tier1FastFailMS = flag.Int("tier1-fast-fail-ms", 200, "Tier 1 fast-fail timeout in milliseconds")
+		tier1OpenTimeoutMS = flag.Int("tier1-open-timeout-ms", 3000, "Tier 1 SSH channel-open timeout in milliseconds")
+		tier1IdleTimeoutMS = flag.Int("tier1-idle-timeout-ms", 120000, "Tier 1 idle I/O timeout in milliseconds")
+		tier1MaxPerUser = flag.Int("tier1-max-conns-per-user", 10, "Tier 1 max concurrent connections per user")
+		tier1MaxPerSource = flag.Int("tier1-max-conns-per-source", 20, "Tier 1 max concurrent connections per source IP")
 		devUser     = flag.String("dev-user", "", "dev-only: route all Tier 1 traffic to this username (empty disables)")
 		hostKeyPath = flag.String("hostkey", "./data/relay_hostkey_ed25519", "path to relay SSH host key (created if missing)")
 		dbPath      = flag.String("db", "./data/relay.db", "identity registry sqlite path")
@@ -151,19 +157,25 @@ func main() {
 	serverCfg.AddHostKey(hostKey)
 
 	spool := &tier2.FileSpool{Root: *spoolDir}
+	spoolPump := newSpoolDeliveryPump()
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, reg, spool); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, reg, spool, spoolPump); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
 	}()
+	go runSpoolNotifyLoop(ctx, reg, spool, spoolPump)
 
 	proxy := &relay.Tier1Proxy{
-		ListenAddr:   *tier1Listen,
-		Registry:     reg,
-		DevRouteUser: *devUser,
-		FastFail:     200 * time.Millisecond,
+		ListenAddr:         *tier1Listen,
+		Registry:           reg,
+		DevRouteUser:       *devUser,
+		FastFail:           time.Duration(*tier1FastFailMS) * time.Millisecond,
+		ChannelOpenTimeout: time.Duration(*tier1OpenTimeoutMS) * time.Millisecond,
+		IdleTimeout:        time.Duration(*tier1IdleTimeoutMS) * time.Millisecond,
+		MaxConnsPerUser:    *tier1MaxPerUser,
+		MaxConnsPerSource:  *tier1MaxPerSource,
 		ResolveUser: func(destIP net.IP) (string, bool) {
 			return reg.GetUserByDestIPv6(destIP)
 		},
@@ -219,7 +231,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -243,11 +255,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, reg 
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, reg, spool)
+		go handleSSHConn(ctx, nc, cfg, reg, spool, pump)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -270,8 +282,8 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 
 	// Deliver any pending Tier 2 spool entries for this user (best-effort).
 	// This keeps the "spool on reconnect" promise without requiring polling.
-	if spool != nil {
-		go deliverPendingSpool(ctx, sshConn, user, spool)
+	if spool != nil && pump != nil {
+		go deliverPendingSpool(ctx, sshConn, user, spool, pump, true)
 	}
 
 	// Ignore global requests.
@@ -305,13 +317,48 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, reg 
 	}
 }
 
-func deliverPendingSpool(ctx context.Context, sshConn *ssh.ServerConn, user string, spool *tier2.FileSpool) {
+func runSpoolNotifyLoop(ctx context.Context, reg *relay.SessionRegistry, spool *tier2.FileSpool, pump *spoolDeliveryPump) {
+	if reg == nil || spool == nil || pump == nil {
+		return
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			users := reg.OnlineUsers()
+			for _, user := range users {
+				sess, ok := reg.GetSession(user)
+				if !ok || sess == nil || sess.Conn == nil {
+					continue
+				}
+				go deliverPendingSpool(ctx, sess.Conn, user, spool, pump, false)
+			}
+		}
+	}
+}
+
+func deliverPendingSpool(ctx context.Context, chOpen relay.SSHChannelOpener, user string, spool *tier2.FileSpool, pump *spoolDeliveryPump, initialDelay bool) {
+	if chOpen == nil || user == "" || spool == nil || pump == nil {
+		return
+	}
+	if !pump.tryLock(user) {
+		return
+	}
+	defer pump.unlock(user)
+
 	list, err := spool.List(user)
 	if err != nil || len(list) == 0 {
 		return
 	}
-	// Small delay to let the client set up channel handlers.
-	time.Sleep(150 * time.Millisecond)
+	// Small delay to let the client set up channel handlers on fresh connect.
+	if initialDelay {
+		time.Sleep(150 * time.Millisecond)
+	}
 
 	for _, meta := range list {
 		select {
@@ -324,7 +371,7 @@ func deliverPendingSpool(ctx context.Context, sshConn *ssh.ServerConn, user stri
 			continue
 		}
 
-		ch, reqs, err := sshConn.OpenChannel("spool-delivery", nil)
+		ch, reqs, err := chOpen.OpenChannel("spool-delivery", nil)
 		if err != nil {
 			_ = rc.Close()
 			continue
@@ -358,6 +405,31 @@ func deliverPendingSpool(ctx context.Context, sshConn *ssh.ServerConn, user stri
 		}
 		_ = ch.Close()
 	}
+}
+
+type spoolDeliveryPump struct {
+	mu       sync.Mutex
+	inFlight map[string]struct{}
+}
+
+func newSpoolDeliveryPump() *spoolDeliveryPump {
+	return &spoolDeliveryPump{inFlight: make(map[string]struct{})}
+}
+
+func (p *spoolDeliveryPump) tryLock(user string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.inFlight[user]; exists {
+		return false
+	}
+	p.inFlight[user] = struct{}{}
+	return true
+}
+
+func (p *spoolDeliveryPump) unlock(user string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.inFlight, user)
 }
 
 func loadOrCreateHostKey(path string) (ssh.Signer, error) {
