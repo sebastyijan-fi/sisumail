@@ -119,6 +119,7 @@ Note: this is intentionally a different trust mode than local `sisumail` client 
 
 Inside shell:
 - `¤help`
+- `¤examples`
 - `¤whoami`
 - `¤status`
 - `¤lookup <user>`

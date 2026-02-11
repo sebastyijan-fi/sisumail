@@ -663,7 +663,7 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 		_, _ = io.WriteString(ch, "identity claimed and bound to your SSH key\n")
 	}
 	_, _ = io.WriteString(ch, "Sisumail is receive-only identity mail + encrypted chat, not conversational outbound email.\n")
-	_, _ = io.WriteString(ch, "Commands: ¤help, ¤whoami, ¤status, ¤lookup <user>, ¤chatq, ¤mailq, ¤quit\n")
+	_, _ = io.WriteString(ch, "Commands: ¤help, ¤examples, ¤whoami, ¤status, ¤lookup <user>, ¤chatq, ¤mailq, ¤quit\n")
 	_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
 	for {
 		_, _ = io.WriteString(ch, "¤ ")
@@ -682,8 +682,14 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 			return 0
 		case "help":
 			_, _ = io.WriteString(ch, "Commands:\n")
-			_, _ = io.WriteString(ch, "¤help\n¤whoami\n¤status\n¤lookup <user>\n¤chatq\n¤mailq\n¤quit\n")
+			_, _ = io.WriteString(ch, "¤help\n¤examples\n¤whoami\n¤status\n¤lookup <user>\n¤chatq\n¤mailq\n¤quit\n")
 			_, _ = io.WriteString(ch, "Quick chat send: ¤<user> <message>\n")
+		case "examples":
+			_, _ = io.WriteString(ch, "Examples:\n")
+			_, _ = io.WriteString(ch, "¤lookup niklas\n")
+			_, _ = io.WriteString(ch, "¤niklas hello from hosted shell\n")
+			_, _ = io.WriteString(ch, "¤status\n")
+			_, _ = io.WriteString(ch, "¤chatq\n")
 		case "whoami":
 			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s source=%s\n", env.username, env.source))
 		case "status":
@@ -837,6 +843,8 @@ func parseRelayShellDirective(line string) (kind string, arg1 string, arg2 strin
 		return "quit", "", ""
 	case "help", "h":
 		return "help", "", ""
+	case "examples", "x":
+		return "examples", "", ""
 	case "whoami", "me":
 		return "whoami", "", ""
 	case "status", "s":

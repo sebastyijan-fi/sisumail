@@ -34,6 +34,8 @@ func TestParseRelayShellDirective(t *testing.T) {
 		{in: "", wantKind: "noop"},
 		{in: "hello", wantKind: "unknown"},
 		{in: "¤help", wantKind: "help"},
+		{in: "¤examples", wantKind: "examples"},
+		{in: "¤x", wantKind: "examples"},
 		{in: "/help", wantKind: "help"},
 		{in: "¤whoami", wantKind: "whoami"},
 		{in: "¤status", wantKind: "status"},

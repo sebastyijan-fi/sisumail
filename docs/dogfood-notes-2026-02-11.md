@@ -62,6 +62,7 @@ Friction observed:
 
 2. Command discoverability still depends on first `¤help`
 - Better than before, but we should add guided first-login copy and short examples.
+- Update: hosted shell now includes `¤examples` with concrete first commands.
 
 Latest validation pass (same day):
 
