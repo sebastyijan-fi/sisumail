@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -80,6 +81,7 @@ func main() {
 		wellKnownPath          = flag.String("well-known-path", "/.well-known/sisu-node", "HTTP path for discovery document")
 		wellKnownFile          = flag.String("well-known-file", "", "path to JSON document served at -well-known-path (required when -well-known-listen is set)")
 		doctor               = flag.Bool("doctor", false, "print production readiness checks and exit")
+		doctorFull           = flag.Bool("doctor-full", false, "run extended production checks (systemd, sockets, routes) and exit")
 	)
 	flag.Parse()
 
@@ -100,8 +102,8 @@ func main() {
 		return
 	}
 
-	if *doctor {
-		code := runRelayDoctor(*dbPath)
+	if *doctor || *doctorFull {
+		code := runRelayDoctor(*dbPath, *doctorFull)
 		if code != 0 {
 			os.Exit(code)
 		}
@@ -330,7 +332,7 @@ func main() {
 	<-ctx.Done()
 }
 
-func runRelayDoctor(dbPath string) int {
+func runRelayDoctor(dbPath string, full bool) int {
 	// Keep output intentionally plain: this is for humans and logs.
 	fail := 0
 	check := func(ok bool, name string, detail string) {
@@ -389,7 +391,49 @@ func runRelayDoctor(dbPath string) int {
 	// Policy checks.
 	check(strings.TrimSpace(os.Getenv("SISUMAIL_ALLOW_CLAIM")) != "true", "policy:allow-claim", "production should keep SISUMAIL_ALLOW_CLAIM=false (invite-only)")
 
+	if full {
+		// AnyIP route sanity.
+		if prefix != "" {
+			// We only check that the command succeeds and output contains "local".
+			out, err := sh("ip", "-6", "route", "show", "local", prefix)
+			check(err == nil && strings.Contains(out, "local"), "net:anyip-route", strings.TrimSpace(out))
+		} else {
+			check(false, "net:anyip-route", "missing SISUMAIL_IPV6_PREFIX")
+		}
+
+		// Socket listeners (best-effort; local-only).
+		ssOut, _ := sh("ss", "-lntup")
+		check(strings.Contains(ssOut, ":2222") || strings.Contains(ssOut, "2222"), "sock:ssh-gateway", "expected listener on :2222 (check systemd and env)")
+		// Tier1: in production expected on :25 (IPv6) but allow staging :2525.
+		wantTier1 := strings.TrimSpace(os.Getenv("SISUMAIL_TIER1_LISTEN"))
+		if wantTier1 == "" {
+			wantTier1 = ":2525"
+		}
+		check(strings.Contains(ssOut, wantTier1), "sock:tier1", "expected listener on "+wantTier1)
+		// DNS: expected :53 when enabled.
+		check(strings.Contains(ssOut, ":53"), "sock:dns", "expected listener on :53 if sisumail-dns is enabled")
+
+		// systemd status (only on systemd hosts).
+		if _, err := exec.LookPath("systemctl"); err == nil {
+			check(systemdActive("sisumail-relay"), "svc:sisumail-relay", "systemctl is-active sisumail-relay failed")
+			// These are optional depending on operator config.
+			_ = systemdActive("sisumail-tier2")
+			_ = systemdActive("sisumail-dns")
+		}
+	}
+
 	return fail
+}
+
+func sh(cmd string, args ...string) (string, error) {
+	c := exec.Command(cmd, args...)
+	b, err := c.CombinedOutput()
+	return string(b), err
+}
+
+func systemdActive(unit string) bool {
+	out, err := sh("systemctl", "is-active", unit)
+	return err == nil && strings.TrimSpace(out) == "active"
 }
 
 func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
