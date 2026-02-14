@@ -201,7 +201,7 @@ func main() {
 		configPath          = flag.String("config", def.ConfigPath, "config file path for default flags")
 		initConfig          = flag.Bool("init", false, "write current core settings to -config and exit")
 		relayAddr           = flag.String("relay", "sisumail.fi:2222", "relay SSH address (default sisumail.fi:2222)")
-		user                = flag.String("user", "niklas", "sisumail username")
+		user                = flag.String("user", "", "sisumail username (set via /app/onboard or -claim)")
 		zone                = flag.String("zone", "sisumail.fi", "root zone name")
 		keyPath             = flag.String("key", def.KeyPath, "ssh private key path")
 		knownHostsPath      = flag.String("known-hosts", filepath.Join(home, ".ssh", "known_hosts"), "known_hosts file for relay host key verification")
@@ -432,6 +432,82 @@ func main() {
 	}
 	if strings.TrimSpace(*claimUsername) != "" {
 		sshCfg.User = "claim"
+	}
+
+	// Setup-mode: no configured user yet. Serve local onboarding UI and let the app
+	// claim a username (claim-v1) against the real relay, then persist config.
+	if strings.TrimSpace(*claimUsername) == "" && strings.TrimSpace(*user) == "" {
+		if strings.TrimSpace(*apiListen) == "" {
+			log.Fatalf("no user configured; run with -api-listen (recommended) or set user in config.env")
+		}
+		token, created, err := ensureLocalAPIToken(*apiTokenPath)
+		if err != nil {
+			log.Fatalf("api token setup: %v", err)
+		}
+		if created {
+			log.Printf("local api token created: %s", *apiTokenPath)
+		}
+		status := localAPIStatus{
+			Profile:            strings.TrimSpace(*profile),
+			User:               "",
+			Relay:              strings.TrimSpace(*relayAddr),
+			TLSSource:          "",
+			TLSAuthenticatedCA: false,
+			SMTPListen:         strings.TrimSpace(*smtpListen),
+			APIListen:          strings.TrimSpace(*apiListen),
+			StartedAt:          time.Now().UTC(),
+		}
+		claimFn := localClaimFn(func(username, inviteCode, relayAddr string) (string, string, []string, error) {
+			username = strings.TrimSpace(username)
+			inviteCode = strings.TrimSpace(inviteCode)
+			relayAddr = strings.TrimSpace(relayAddr)
+			if username == "" || inviteCode == "" || relayAddr == "" {
+				return "", "", nil, fmt.Errorf("missing username/invite/relay")
+			}
+			sshCfg := &ssh.ClientConfig{
+				User:            "claim",
+				Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+				HostKeyCallback: hostKeyCB,
+				Timeout:         10 * time.Second,
+			}
+			c, err := ssh.Dial("tcp", relayAddr, sshCfg)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("ssh dial: %w", err)
+			}
+			defer c.Close()
+			ch, reqs, err := c.OpenChannel("claim-v1", nil)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("claim channel: %w", err)
+			}
+			go ssh.DiscardRequests(reqs)
+			pubText := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+			if err := proto.WriteClaimRequest(ch, proto.ClaimRequest{
+				Username:   username,
+				PubKeyText: pubText,
+				InviteCode: inviteCode,
+			}); err != nil {
+				_ = ch.Close()
+				return "", "", nil, fmt.Errorf("claim request: %w", err)
+			}
+			resp, err := proto.ReadClaimResponse(ch)
+			_ = ch.Close()
+			if err != nil {
+				return "", "", nil, fmt.Errorf("claim response: %w", err)
+			}
+			if !resp.OK {
+				return "", "", nil, fmt.Errorf("%s", resp.Message)
+			}
+			addr := strings.TrimSpace(resp.Address)
+			if addr == "" {
+				addr = "inbox@" + resp.Username + "." + strings.TrimSuffix(*zone, ".")
+			}
+			return resp.Username, addr, resp.Invites, nil
+		})
+		log.Printf("setup-mode: no user configured yet; open http://%s/app/onboard", strings.TrimSpace(*apiListen))
+		if err := runLocalAPIServer(ctx, strings.TrimSpace(*apiListen), token, strings.TrimSpace(*apiTokenPath), strings.TrimSpace(*activeProfilePath), home, status, nil, claimFn); err != nil {
+			log.Fatalf("local api server error: %v", err)
+		}
+		return
 	}
 
 	client, err := ssh.Dial("tcp", *relayAddr, sshCfg)
@@ -2038,12 +2114,20 @@ func runLocalAPIServer(
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if strings.TrimSpace(profileUser(home, status.Profile)) == "" {
+			http.Redirect(w, r, "/app/onboard", http.StatusFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, strings.ReplaceAll(localInboxAppHTML, "__APP_SESSION_TOKEN__", appSessionToken))
 	})
 	rootMux.HandleFunc("/app/chat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if strings.TrimSpace(profileUser(home, status.Profile)) == "" {
+			http.Redirect(w, r, "/app/onboard", http.StatusFound)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -2395,7 +2479,7 @@ const localOnboardAppHTML = `<!doctype html>
       <button id="go" class="primary">Claim And Set Up This Device</button>
       <div id="out" class="muted" style="margin-top:10px"></div>
       <pre id="next" style="display:none"></pre>
-      <div style="margin-top:10px"><a class="muted" href="/app/inbox">Skip to inbox</a></div>
+      <div style="margin-top:10px" class="muted">You’ll get access to Inbox and Chat after you claim.</div>
     </div>
   </div>
   <script>
