@@ -29,6 +29,8 @@ curl -fsSLo "${tmp}/sha256sum.txt" "${base}/download/${tag}/sha256sum.txt"
 
 tar -C "${tmp}" -xzf "${tmp}/${fname}"
 install -m 0755 "${tmp}/sisumail-relay" "${BIN_DIR}/sisumail-relay"
+install -m 0755 "${tmp}/sisumail-tier2" "${BIN_DIR}/sisumail-tier2"
 install -m 0755 "${tmp}/sisumail" "${BIN_DIR}/sisumail"
 
 systemctl restart sisumail-relay
+systemctl restart sisumail-tier2 || true
