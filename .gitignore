@@ -12,3 +12,9 @@
 /spool/
 /certs/
 
+# Generated conformance/discovery artifacts
+/conformance/*.report.json
+/deploy/well-known/sisu-node.generated.json
+
+# Local caches (Codex/CI/dev)
+/.cache/

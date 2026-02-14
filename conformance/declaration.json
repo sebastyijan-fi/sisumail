@@ -1,0 +1,20 @@
+{
+  "implementation": "sisumail",
+  "version_target": "sisu-v1",
+  "profiles": [
+    "core-node",
+    "relay-node",
+    "client"
+  ],
+  "unsupported_optional_capabilities": [
+    "quic-transport",
+    "multi-hop-federation-routing",
+    "ios-push-without-apns"
+  ],
+  "security_caveats": [
+    "Tier 2 relay can observe plaintext transiently during SMTP ingest before encrypt-on-ingest.",
+    "Static recipient-key envelope encryption does not provide forward secrecy.",
+    "SMTP sender-side TLS authentication is best-effort unless DANE and/or MTA-STS are deployed by peer domains."
+  ],
+  "notes": "Sisumail is receive-only mail infrastructure; outbound internet email sending is intentionally unsupported."
+}
