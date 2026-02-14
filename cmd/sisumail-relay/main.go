@@ -387,6 +387,12 @@ func runRelayDoctor(dbPath string, full bool) int {
 	check(hcloud != "", "env:HCLOUD_TOKEN", "set HCLOUD_TOKEN so provisioning + acme-dns01 can work")
 
 	// DB checks.
+	if strings.TrimSpace(dbPath) == "" || strings.TrimSpace(dbPath) == "./data/relay.db" {
+		// Operator installs use /var/lib/sisumail/relay.db.
+		if _, err := os.Stat("/var/lib/sisumail/relay.db"); err == nil {
+			dbPath = "/var/lib/sisumail/relay.db"
+		}
+	}
 	st, err := identity.Open(dbPath)
 	if err != nil {
 		check(false, "db:open", err.Error())
