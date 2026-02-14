@@ -70,6 +70,7 @@ fetch_release() {
   install -d -m 0755 "${BIN_DIR}"
   install -m 0755 /tmp/sisumail-install/sisumail-relay "${BIN_DIR}/sisumail-relay"
   install -m 0755 /tmp/sisumail-install/sisumail-tier2 "${BIN_DIR}/sisumail-tier2"
+  install -m 0755 /tmp/sisumail-install/sisumail-dns "${BIN_DIR}/sisumail-dns"
   install -m 0755 /tmp/sisumail-install/sisumail "${BIN_DIR}/sisumail"
 }
 
@@ -187,6 +188,42 @@ ReadWritePaths=/var/lib/sisumail /var/spool/sisumail
 WantedBy=multi-user.target
 EOF
 
+  cat > /etc/systemd/system/sisumail-dns.service <<'EOF'
+[Unit]
+Description=Sisumail Authoritative DNS (delegated v6 zone)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sisu
+Group=sisu
+EnvironmentFile=/etc/sisumail.env
+ExecStart=/bin/sh -c '/usr/local/bin/sisumail-dns \
+  -zone "${SISUMAIL_DNS_DELEGATED_ZONE:-v6.${SISUMAIL_DNS_ZONE}.}" \
+  -db /var/lib/sisumail/relay.db \
+  -listen-udp "${SISUMAIL_DNS_LISTEN_UDP:-:53}" \
+  -listen-tcp "${SISUMAIL_DNS_LISTEN_TCP:-:53}" \
+  -soa-ns "${SISUMAIL_DNS_SOA_NS:-ns1.${SISUMAIL_DNS_ZONE}.}" \
+  -soa-mbox "${SISUMAIL_DNS_SOA_MBOX:-hostmaster.${SISUMAIL_DNS_ZONE}.}" \
+  -ttl "${SISUMAIL_DNS_TTL:-300}" \
+  -neg-ttl "${SISUMAIL_DNS_NEG_TTL:-60}" \
+  -max-qps-per-source "${SISUMAIL_DNS_MAX_QPS_PER_SOURCE:-200}"'
+Restart=always
+RestartSec=2
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   cat > /etc/systemd/system/sisumail-update.service <<'EOF'
 [Unit]
 Description=Sisumail Update (pull latest release and restart services)
@@ -248,10 +285,12 @@ install -m 0755 "${tmp}/sisumail" "${BIN_DIR}/sisumail"
 
 systemctl restart sisumail-relay
 systemctl restart sisumail-tier2 || true
+systemctl restart sisumail-dns || true
 EOF
 
   chmod 0644 /etc/systemd/system/sisumail-relay.service
   chmod 0644 /etc/systemd/system/sisumail-tier2.service
+  chmod 0644 /etc/systemd/system/sisumail-dns.service
   chmod 0644 /etc/systemd/system/sisumail-anyip.service
   chmod 0644 /etc/systemd/system/sisumail-update.service
   chmod 0644 /etc/systemd/system/sisumail-update.timer
@@ -291,6 +330,8 @@ ensure_env_file() {
 # SISUMAIL_WELL_KNOWN_FILE: JSON file served at discovery path
 # SISUMAIL_TIER1_*: Tier 1 hardening controls.
 # SISUMAIL_ACME_DNS01_PER_USER_PER_MIN: relay ACME control-channel rate limit
+# SISUMAIL_DNS_DELEGATED_ZONE: delegated zone name (FQDN with trailing dot), default v6.<zone>.
+# SISUMAIL_DNS_LISTEN_UDP/TCP: dns listeners (default :53).
 HCLOUD_TOKEN=
 SISUMAIL_DNS_ZONE=
 SISUMAIL_IPV6_PREFIX=
@@ -316,6 +357,14 @@ SISUMAIL_TIER1_MAX_BYTES_PER_CONN=10485760
 SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
 SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
 SISUMAIL_ACME_DNS01_PER_USER_PER_MIN=30
+SISUMAIL_DNS_DELEGATED_ZONE=
+SISUMAIL_DNS_LISTEN_UDP=:53
+SISUMAIL_DNS_LISTEN_TCP=:53
+SISUMAIL_DNS_SOA_NS=
+SISUMAIL_DNS_SOA_MBOX=
+SISUMAIL_DNS_TTL=300
+SISUMAIL_DNS_NEG_TTL=60
+SISUMAIL_DNS_MAX_QPS_PER_SOURCE=200
 EOF
   chown root:sisu "${ENV_FILE}"
   chmod 0640 "${ENV_FILE}"
@@ -344,11 +393,13 @@ main() {
 
   systemctl enable --now sisumail-relay.service
   systemctl enable --now sisumail-tier2.service
+  systemctl enable --now sisumail-dns.service || true
   systemctl enable --now sisumail-anyip.service || true
   systemctl enable --now sisumail-update.timer
 
   echo "installed: ${BIN_DIR}/sisumail-relay"
   echo "installed: ${BIN_DIR}/sisumail-tier2"
+  echo "installed: ${BIN_DIR}/sisumail-dns"
   echo "next: edit ${ENV_FILE} and restart relay"
 }
 

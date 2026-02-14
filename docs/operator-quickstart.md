@@ -59,6 +59,12 @@ Per user `<u>` you will publish:
 
 Templates: see `docs/dns-records.md`.
 
+## Delegated DNS (Recommended)
+
+Run `sisumail-dns` on the relay host and delegate the `v6.<zone>` subzone to it. This avoids per-user `AAAA` record sprawl in your DNS provider.
+
+See `docs/dns-delegation.md`.
+
 ## 1b) Publish `/.well-known/sisu-node`
 
 v1 discovery should expose authoritative node metadata at:

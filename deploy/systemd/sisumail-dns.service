@@ -1,0 +1,32 @@
+[Unit]
+Description=Sisumail Authoritative DNS (delegated v6 zone)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sisumail.env
+ExecStart=/bin/sh -c '/usr/local/bin/sisumail-dns \
+  -zone "${SISUMAIL_DNS_DELEGATED_ZONE:-v6.${SISUMAIL_DNS_ZONE}.}" \
+  -db /var/lib/sisumail/relay.db \
+  -listen-udp "${SISUMAIL_DNS_LISTEN_UDP:-:53}" \
+  -listen-tcp "${SISUMAIL_DNS_LISTEN_TCP:-:53}" \
+  -soa-ns "${SISUMAIL_DNS_SOA_NS:-ns1.${SISUMAIL_DNS_ZONE}.}" \
+  -soa-mbox "${SISUMAIL_DNS_SOA_MBOX:-hostmaster.${SISUMAIL_DNS_ZONE}.}" \
+  -ttl "${SISUMAIL_DNS_TTL:-300}" \
+  -neg-ttl "${SISUMAIL_DNS_NEG_TTL:-60}" \
+  -max-qps-per-source "${SISUMAIL_DNS_MAX_QPS_PER_SOURCE:-200}"'
+Restart=always
+RestartSec=2
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail
+
+[Install]
+WantedBy=multi-user.target
+
