@@ -25,7 +25,7 @@ echo "[dns] expects on VPS:"
 echo "  - /etc/sisumail.env has: HCLOUD_TOKEN, SISUMAIL_DNS_ZONE"
 
 cat <<'PY' | "${ssh_cmd[@]}" "python3 -"
-import json, os, sys, urllib.request, urllib.parse, subprocess
+import json, sys, urllib.request, urllib.parse, subprocess
 
 def sh(cmd):
   return subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -45,7 +45,7 @@ def envfile(path):
   return d
 
 env = envfile("/etc/sisumail.env")
-token = env.get("HCLOUD_TOKEN","").strip()
+token = (env.get("HCLOUD_TOKEN","").strip() or env.get("HETZNER_CLOUD_TOKEN","").strip())
 zone = env.get("SISUMAIL_DNS_ZONE","").strip().rstrip(".")
 if not token:
   print("error: missing HCLOUD_TOKEN in /etc/sisumail.env", file=sys.stderr)
@@ -55,12 +55,13 @@ if not zone:
   sys.exit(2)
 
 def req(method, path, body=None):
-  url = "https://dns.hetzner.com/api/v1" + path
+  # Hetzner Cloud DNS API (Console). Sisumail uses this, not the deprecated dns.hetzner.com API.
+  url = "https://api.hetzner.cloud/v1" + path
   data = None
   if body is not None:
     data = json.dumps(body).encode("utf-8")
   r = urllib.request.Request(url, data=data, method=method)
-  r.add_header("Auth-API-Token", token)
+  r.add_header("Authorization", "Bearer " + token)
   r.add_header("Content-Type", "application/json")
   with urllib.request.urlopen(r, timeout=30) as resp:
     b = resp.read()
@@ -69,26 +70,52 @@ def req(method, path, body=None):
     return json.loads(b.decode("utf-8"))
 
 def zone_id_by_name(name):
-  zs = req("GET", "/zones")["zones"]
+  q = urllib.parse.urlencode({"name": name})
+  zs = (req("GET", "/zones?" + q) or {}).get("zones") or []
   for z in zs:
-    if z["name"].rstrip(".") == name:
-      return z["id"]
+    if (z.get("name") or "").rstrip(".") == name:
+      return str(z.get("id"))
   raise RuntimeError("zone not found in hetzner dns: %s" % name)
 
 def list_records(zid):
-  return req("GET", f"/records?zone_id={urllib.parse.quote(zid)}")["records"]
+  return (req("GET", f"/zones/{zid}/rrsets") or {}).get("rrsets") or []
+
+def rr_name(fqdn, zone):
+  fqdn = fqdn.strip().rstrip(".")
+  if fqdn in ("", "@", zone):
+    return "@"
+  if fqdn.endswith("." + zone):
+    fqdn = fqdn[:-(len(zone)+1)]
+  return fqdn.lower()
+
+def get_rrset(zid, name, typ):
+  name = rr_name(name, zone)
+  typ = typ.strip().upper()
+  try:
+    return (req("GET", f"/zones/{zid}/rrsets/{urllib.parse.quote(name)}/{typ}") or {}).get("rrset")
+  except Exception as e:
+    if "http 404" in str(e):
+      return None
+    raise
+
+def create_rrset(zid, name, typ, ttl, values):
+  name = rr_name(name, zone)
+  typ = typ.strip().upper()
+  payload = {"name": name, "type": typ, "ttl": int(ttl), "records": [{"value": v} for v in values]}
+  return req("POST", f"/zones/{zid}/rrsets", payload)
+
+def set_records(zid, name, typ, values):
+  name = rr_name(name, zone)
+  typ = typ.strip().upper()
+  payload = {"records": [{"value": v} for v in values]}
+  return req("POST", f"/zones/{zid}/rrsets/{urllib.parse.quote(name)}/{typ}/actions/set_records", payload)
 
 def upsert(zid, name, typ, ttl, value):
-  name = name.rstrip(".")
-  existing = [r for r in list_records(zid) if r["name"].rstrip(".")==name and r["type"]==typ]
-  if existing:
-    rid = existing[0]["id"]
-    req("PUT", f"/records/{rid}", {"value": value, "ttl": ttl, "type": typ, "name": name, "zone_id": zid})
-    # Delete any extras to avoid provider-side weirdness.
-    for r in existing[1:]:
-      req("DELETE", f"/records/{r['id']}")
+  rr = get_rrset(zid, name, typ)
+  if rr is None:
+    create_rrset(zid, name, typ, ttl, [value])
   else:
-    req("POST", "/records", {"value": value, "ttl": ttl, "type": typ, "name": name, "zone_id": zid})
+    set_records(zid, name, typ, [value])
 
 def get_public_ipv6():
   # Prefer the routed primary /64's ::1, but actually detect what the box owns.
@@ -113,4 +140,3 @@ print("ok glue", ns, "AAAA", ipv6)
 PY
 
 echo "[dns] done"
-
