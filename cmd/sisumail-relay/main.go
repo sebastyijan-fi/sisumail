@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +55,14 @@ func main() {
 		username               = flag.String("username", "", "identity username for -add-user")
 		pubkeyPath             = flag.String("pubkey", "", "path to SSH public key file for -add-user")
 		ipv6Str                = flag.String("ipv6", "", "IPv6 address for -add-user")
-		allowClaim             = flag.Bool("allow-claim", true, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
+		allowClaim             = flag.Bool("allow-claim", false, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
+		mintInvites            = flag.Bool("mint-invites", false, "operator: mint root invite codes and print them to stdout (requires SISUMAIL_INVITE_PEPPER in production)")
+		mintInvitesN           = flag.Int("mint-invites-n", 1, "operator: number of root invite codes to mint when -mint-invites is set")
+		claimPerSourcePerHour  = flag.Int("claim-per-source-per-hour", 3, "max new identity claims per source bucket per hour (0 disables)")
+		claimPerSourcePerDay   = flag.Int("claim-per-source-per-day", 12, "max new identity claims per source bucket per day (0 disables)")
+		claimGlobalPerHour     = flag.Int("claim-global-per-hour", 200, "max new identity claims globally per hour (0 disables)")
+		claimGlobalPerDay      = flag.Int("claim-global-per-day", 1000, "max new identity claims globally per day (0 disables)")
+		claimLogRetentionDays  = flag.Int("claim-log-retention-days", 30, "days to retain claim log rows for rate limiting (0 disables pruning)")
 		spoolDir               = flag.String("spool-dir", "/var/spool/sisumail", "Tier 2 ciphertext spool root (for delivery on reconnect)")
 		chatSpoolDir           = flag.String("chat-spool-dir", "/var/spool/sisumail/chat", "encrypted chat queue root (for offline delivery)")
 		chatMaxBytes           = flag.Int64("chat-max-bytes", 64<<10, "max encrypted chat payload bytes per message")
@@ -66,6 +74,9 @@ func main() {
 		acmeDNS01PerMin        = flag.Int("acme-dns01-per-user-per-min", 30, "max ACME DNS-01 control operations per user per minute")
 		obsListen              = flag.String("obs-listen", "", "observability HTTP listen address (disabled when empty), e.g. 127.0.0.1:9090")
 		obsReadHeaderTimeoutMS = flag.Int("obs-read-header-timeout-ms", 5000, "observability HTTP read-header timeout in milliseconds")
+		wellKnownListen        = flag.String("well-known-listen", "", "public discovery HTTP listen address (disabled when empty), e.g. :8080")
+		wellKnownPath          = flag.String("well-known-path", "/.well-known/sisu-node", "HTTP path for discovery document")
+		wellKnownFile          = flag.String("well-known-file", "", "path to JSON document served at -well-known-path (required when -well-known-listen is set)")
 	)
 	flag.Parse()
 
@@ -83,6 +94,18 @@ func main() {
 
 	if *initDB {
 		log.Printf("db initialized: %s", *dbPath)
+		return
+	}
+
+	if *mintInvites {
+		pepper := strings.TrimSpace(os.Getenv("SISUMAIL_INVITE_PEPPER"))
+		codes, err := store.MintRootInvites(ctx, *mintInvitesN, pepper)
+		if err != nil {
+			log.Fatalf("mint invites: %v", err)
+		}
+		for _, c := range codes {
+			fmt.Println(c)
+		}
 		return
 	}
 
@@ -127,11 +150,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("host key: %v", err)
 	}
+	claimLimits := identity.ClaimLimits{
+		PerSourcePerHour: *claimPerSourcePerHour,
+		PerSourcePerDay:  *claimPerSourcePerDay,
+		GlobalPerHour:    *claimGlobalPerHour,
+		GlobalPerDay:     *claimGlobalPerDay,
+		RetentionDays:    *claimLogRetentionDays,
+	}
 	serverCfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(connMeta ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-			u := strings.TrimSpace(connMeta.User())
-			if u == "" {
-				return nil, fmt.Errorf("missing username")
+			raw := strings.TrimSpace(connMeta.User())
+			// Bootstrap user for invite-only onboarding: accepts any key but only gets claim-v1 channel.
+			if raw == "claim" {
+				return &ssh.Permissions{Extensions: map[string]string{
+					"identity_status":    "bootstrap",
+					"canonical_username": "claim",
+				}}, nil
+			}
+			u, err := identity.CanonicalUsername(raw)
+			if err != nil {
+				return nil, fmt.Errorf("invalid username")
 			}
 			if isReservedUsername(u) {
 				return nil, fmt.Errorf("reserved username")
@@ -139,7 +177,10 @@ func main() {
 			// Dev override: allow any key for the dev user to reduce setup friction.
 			// For production, remove this and require a provisioned identity.
 			if *devUser != "" && u == *devUser {
-				return &ssh.Permissions{Extensions: map[string]string{"identity_status": "dev-user"}}, nil
+				return &ssh.Permissions{Extensions: map[string]string{
+					"identity_status":    "dev-user",
+					"canonical_username": u,
+				}}, nil
 			}
 
 			id, err := store.GetByUsername(ctx, u)
@@ -153,9 +194,13 @@ func main() {
 				if prov == nil || ipv6Prefix == nil {
 					return nil, fmt.Errorf("unknown user (claim disabled: missing DNS env)")
 				}
-				claimed, isNew, err := store.Claim(ctx, u, pubKey, ipv6Prefix)
+				bucket := sourceBucket(connMeta.RemoteAddr())
+				claimed, isNew, err := store.Claim(ctx, u, pubKey, ipv6Prefix, bucket, claimLimits)
 				if err != nil {
 					log.Printf("claim error: user=%s remote=%s err=%v", u, connMeta.RemoteAddr(), err)
+					if errors.Is(err, identity.ErrClaimRateLimited) {
+						return nil, fmt.Errorf("claim rate limited")
+					}
 					return nil, fmt.Errorf("claim failed")
 				}
 				if isNew {
@@ -166,13 +211,23 @@ func main() {
 					}
 					reg.SetUserDestIPv6(u, claimed.IPv6)
 					log.Printf("claimed identity: %s -> %s", u, claimed.IPv6.String())
+					return &ssh.Permissions{Extensions: map[string]string{
+						"identity_status":    "claimed-new",
+						"canonical_username": u,
+					}}, nil
 				}
-				return &ssh.Permissions{Extensions: map[string]string{"identity_status": "claimed-new"}}, nil
+				return &ssh.Permissions{Extensions: map[string]string{
+					"identity_status":    "existing",
+					"canonical_username": u,
+				}}, nil
 			}
 			if subtle.ConstantTimeCompare(id.PubKey.Marshal(), pubKey.Marshal()) != 1 {
 				return nil, fmt.Errorf("wrong key")
 			}
-			return &ssh.Permissions{Extensions: map[string]string{"identity_status": "existing"}}, nil
+			return &ssh.Permissions{Extensions: map[string]string{
+				"identity_status":    "existing",
+				"canonical_username": u,
+			}}, nil
 		},
 	}
 	serverCfg.AddHostKey(hostKey)
@@ -193,7 +248,7 @@ func main() {
 	})
 
 	go func() {
-		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump, acmeCtrl, stats, ready.setSSHListening); err != nil {
+		if err := runSSHGateway(ctx, *sshListen, serverCfg, store, reg, spool, chatSpool, chatGuard, spoolPump, acmeCtrl, prov, ipv6Prefix, claimLimits, stats, ready.setSSHListening); err != nil {
 			log.Printf("ssh gateway error: %v", err)
 			cancel()
 		}
@@ -231,6 +286,17 @@ func main() {
 			}
 		}()
 	}
+	if strings.TrimSpace(*wellKnownListen) != "" {
+		if strings.TrimSpace(*wellKnownFile) == "" {
+			log.Fatalf("-well-known-file is required when -well-known-listen is set")
+		}
+		go func() {
+			if err := runWellKnownServer(ctx, *wellKnownListen, *wellKnownPath, *wellKnownFile, time.Duration(*obsReadHeaderTimeoutMS)*time.Millisecond); err != nil {
+				log.Printf("well-known server error: %v", err)
+				cancel()
+			}
+		}()
+	}
 
 	<-ctx.Done()
 }
@@ -244,7 +310,7 @@ func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
 	}
 	zone := strings.TrimSpace(os.Getenv("SISUMAIL_DNS_ZONE"))
 	prefixStr := strings.TrimSpace(os.Getenv("SISUMAIL_IPV6_PREFIX"))
-	if token == "" || zone == "" || prefixStr == "" {
+	if prefixStr == "" {
 		return nil, nil
 	}
 	_, ipnet, err := net.ParseCIDR(prefixStr)
@@ -252,8 +318,93 @@ func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
 		log.Printf("invalid SISUMAIL_IPV6_PREFIX: %v", err)
 		return nil, nil
 	}
+	if token == "" || zone == "" {
+		// Allow local/dev runs to allocate from a prefix without DNS automation.
+		return nil, ipnet
+	}
 	dns := hetznercloud.NewClient(token, zone)
 	return &provision.Provisioner{DNS: dns, ZoneName: zone}, ipnet
+}
+
+func handleClaimV1Channel(ch ssh.NewChannel, identityStatus string, store *identity.Store, reg *relay.SessionRegistry, prov *provision.Provisioner, ipv6Prefix *net.IPNet, claimLimits identity.ClaimLimits, sourceAddr net.Addr, stats *observability.RelayStats) {
+	c, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	defer c.Close()
+
+	if identityStatus != "bootstrap" || store == nil || reg == nil {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "claim unavailable"})
+		return
+	}
+	devNoProvision := strings.TrimSpace(os.Getenv("SISUMAIL_DEV_CLAIM_NO_PROVISION")) == "1"
+	if (prov == nil || ipv6Prefix == nil) && !devNoProvision {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "operator not configured"})
+		return
+	}
+	if ipv6Prefix == nil {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "operator not configured"})
+		return
+	}
+
+	req, err := proto.ReadClaimRequest(c)
+	if err != nil {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "bad request"})
+		return
+	}
+
+	u, err := identity.CanonicalUsername(req.Username)
+	if err != nil || isReservedUsername(u) {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "invalid username"})
+		return
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(req.PubKeyText))
+	if err != nil {
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "invalid pubkey"})
+		return
+	}
+	bucket := sourceBucket(sourceAddr)
+	pepper := strings.TrimSpace(os.Getenv("SISUMAIL_INVITE_PEPPER"))
+
+	id, childInvites, err := store.ClaimWithInvite(context.Background(), u, pub, ipv6Prefix, bucket, claimLimits, req.InviteCode, pepper)
+	if err != nil {
+		msg := "claim failed"
+		switch {
+		case errors.Is(err, identity.ErrClaimRateLimited):
+			msg = "rate limited"
+		case errors.Is(err, identity.ErrInviteInvalid):
+			msg = "invite invalid"
+		case errors.Is(err, identity.ErrInviteRedeemed):
+			msg = "invite redeemed"
+		default:
+			if strings.Contains(strings.ToLower(err.Error()), "already claimed") {
+				msg = "username already claimed"
+			}
+		}
+		_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: msg})
+		return
+	}
+
+	// Provision DNS (and any other operator bindings). Roll back on failure.
+	if !devNoProvision {
+		if err := prov.ProvisionUser(u, id.IPv6); err != nil {
+			_ = store.DeleteByUsername(context.Background(), u)
+			_ = proto.WriteClaimResponse(c, proto.ClaimResponse{OK: false, Message: "provision failed"})
+			return
+		}
+	}
+	reg.SetUserDestIPv6(u, id.IPv6)
+
+	address := fmt.Sprintf("inbox@%s.sisumail.fi", u)
+	_ = proto.WriteClaimResponse(c, proto.ClaimResponse{
+		OK:       true,
+		Username: u,
+		IPv6:     id.IPv6.String(),
+		Address:  address,
+		Invites:  childInvites,
+	})
+	_ = stats // reserved for future claim counters
 }
 
 func isReservedUsername(u string) bool {
@@ -276,7 +427,7 @@ func isReservedUsername(u string) bool {
 	return false
 }
 
-func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, stats *observability.RelayStats, onListening func()) error {
+func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, prov *provision.Provisioner, ipv6Prefix *net.IPNet, claimLimits identity.ClaimLimits, stats *observability.RelayStats, onListening func()) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -303,11 +454,11 @@ func runSSHGateway(ctx context.Context, addr string, cfg *ssh.ServerConfig, stor
 			}
 			return err
 		}
-		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump, acmeCtrl, stats)
+		go handleSSHConn(ctx, nc, cfg, store, reg, spool, chatSpool, chatGuard, pump, acmeCtrl, prov, ipv6Prefix, claimLimits, stats)
 	}
 }
 
-func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, stats *observability.RelayStats) {
+func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, store *identity.Store, reg *relay.SessionRegistry, spool *tier2.FileSpool, chatSpool *chatqueue.Store, chatGuard *chatGuard, pump *spoolDeliveryPump, acmeCtrl *acmeDNS01Controller, prov *provision.Provisioner, ipv6Prefix *net.IPNet, claimLimits identity.ClaimLimits, stats *observability.RelayStats) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -316,17 +467,26 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 	}
 	defer sshConn.Close()
 
-	user := strings.TrimSpace(sshConn.User())
-	if user == "" {
+	rawUser := strings.TrimSpace(sshConn.User())
+	if rawUser == "" {
 		return
 	}
+	user := rawUser
 	source := remoteIPString(sshConn.RemoteAddr())
 	identityStatus := "existing"
 	if sshConn.Permissions != nil && sshConn.Permissions.Extensions != nil {
 		if s := strings.TrimSpace(sshConn.Permissions.Extensions["identity_status"]); s != "" {
 			identityStatus = s
 		}
+		if cu := strings.TrimSpace(sshConn.Permissions.Extensions["canonical_username"]); cu != "" {
+			user = cu
+		}
 	}
+	canon, err := identity.CanonicalUsername(user)
+	if err != nil {
+		return
+	}
+	user = canon
 	if store != nil {
 		store.TouchLastSeen(context.Background(), user)
 	}
@@ -366,19 +526,28 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 				return
 			}
 			go func(ch ssh.NewChannel) {
-				switch ch.ChannelType() {
+				channelType := strings.TrimSpace(ch.ChannelType())
+				if !isSupportedClientChannelType(channelType) {
+					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
+					return
+				}
+				if identityStatus == "bootstrap" && channelType != "claim-v1" {
+					_ = ch.Reject(ssh.Prohibited, "bootstrap session only supports claim-v1")
+					return
+				}
+				switch channelType {
 				case "session":
 					c, reqs, err := ch.Accept()
 					if err != nil {
 						return
 					}
-					execLike := pollSessionRequests(reqs, 150*time.Millisecond)
+					mode := pollSessionRequests(reqs, 150*time.Millisecond)
 					status := uint32(0)
-					if !execLike {
+					if !mode.execLike {
 						go func() {
 							handleSessionRequests(reqs)
 						}()
-						status = runHostedShell(c, hostedShellEnv{
+						status = runHostedShell(c, mode.ptyRequested, hostedShellEnv{
 							username:       user,
 							source:         source,
 							identityStatus: identityStatus,
@@ -401,12 +570,20 @@ func handleSSHConn(ctx context.Context, nc net.Conn, cfg *ssh.ServerConfig, stor
 					handleChatSendChannel(ch, user, source, reg, chatSpool, chatGuard, stats)
 				case "acme-dns01":
 					handleACMEDNS01Channel(ch, user, acmeCtrl)
-				default:
-					_ = ch.Reject(ssh.UnknownChannelType, "unsupported")
-					return
+				case "claim-v1":
+					handleClaimV1Channel(ch, identityStatus, store, reg, prov, ipv6Prefix, claimLimits, sshConn.RemoteAddr(), stats)
 				}
 			}(newCh)
 		}
+	}
+}
+
+func isSupportedClientChannelType(channelType string) bool {
+	switch strings.TrimSpace(channelType) {
+	case "session", "key-lookup", "chat-send", "acme-dns01", "claim-v1":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -581,7 +758,12 @@ func handleACMEDNS01Channel(ch ssh.NewChannel, user string, ctrl *acmeDNS01Contr
 	_ = proto.WriteACMEDNS01Response(c, proto.ACMEDNS01Response{OK: true})
 }
 
-func pollSessionRequests(reqs <-chan *ssh.Request, wait time.Duration) (execLike bool) {
+type sessionMode struct {
+	execLike     bool
+	ptyRequested bool
+}
+
+func pollSessionRequests(reqs <-chan *ssh.Request, wait time.Duration) (mode sessionMode) {
 	if wait <= 0 {
 		wait = 150 * time.Millisecond
 	}
@@ -591,8 +773,10 @@ func pollSessionRequests(reqs <-chan *ssh.Request, wait time.Duration) (execLike
 	// First request: wait briefly for common ssh request patterns (exec/shell/pty).
 	select {
 	case req, ok := <-reqs:
-		if ok && handleSessionRequest(req) {
-			execLike = true
+		if ok {
+			execLike, ptyRequested := handleSessionRequest(req)
+			mode.execLike = mode.execLike || execLike
+			mode.ptyRequested = mode.ptyRequested || ptyRequested
 		}
 	case <-timer.C:
 	}
@@ -602,31 +786,32 @@ func pollSessionRequests(reqs <-chan *ssh.Request, wait time.Duration) (execLike
 		select {
 		case req, ok := <-reqs:
 			if !ok {
-				return execLike
+				return mode
 			}
-			if handleSessionRequest(req) {
-				execLike = true
-			}
+			execLike, ptyRequested := handleSessionRequest(req)
+			mode.execLike = mode.execLike || execLike
+			mode.ptyRequested = mode.ptyRequested || ptyRequested
 		default:
-			return execLike
+			return mode
 		}
 	}
 }
 
-func handleSessionRequest(req *ssh.Request) (execLike bool) {
+func handleSessionRequest(req *ssh.Request) (execLike bool, ptyRequested bool) {
 	if req == nil {
-		return false
+		return false, false
 	}
-	allow, isExecLike := sessionRequestAllowed(req.Type)
+	reqType := strings.TrimSpace(strings.ToLower(req.Type))
+	allow, isExecLike := sessionRequestAllowed(reqType)
 	if req.WantReply {
 		_ = req.Reply(allow, nil)
 	}
-	return isExecLike
+	return isExecLike, reqType == "pty-req"
 }
 
 func handleSessionRequests(reqs <-chan *ssh.Request) {
 	for req := range reqs {
-		_ = handleSessionRequest(req)
+		_, _ = handleSessionRequest(req)
 	}
 }
 
@@ -653,26 +838,52 @@ type hostedShellEnv struct {
 	stats          *observability.RelayStats
 }
 
-func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
+type shellSettings struct {
+	compact bool
+	motd    bool
+}
+
+type shellEditorState struct {
+	history   []string
+	histIndex int
+	draft     string
+}
+
+type shellSessionState struct {
+	settings shellSettings
+	editor   shellEditorState
+}
+
+func runHostedShell(ch ssh.Channel, ptyRequested bool, env hostedShellEnv) uint32 {
 	if ch == nil {
 		return 1
 	}
 	in := bufio.NewReader(ch)
-	_, _ = io.WriteString(ch, "Sisumail Hosted Shell\n")
-	if env.identityStatus == "claimed-new" {
-		_, _ = io.WriteString(ch, "identity claimed and bound to your SSH key\n")
+	state := shellSessionState{
+		settings: shellSettings{compact: false, motd: true},
+		editor:   shellEditorState{histIndex: -1},
 	}
-	_, _ = io.WriteString(ch, "Sisumail is receive-only identity mail + encrypted chat, not conversational outbound email.\n")
-	_, _ = io.WriteString(ch, "Type help (or /help). Quick chat send: <user> <message>\n")
+	if state.settings.motd {
+		shellWrite(ch, "Sisumail Hosted Shell\n")
+		if env.identityStatus == "claimed-new" {
+			shellWrite(ch, "identity claimed and bound to your SSH key\n")
+		}
+		shellWrite(ch, "Sisumail is sovereign receive-only mail infrastructure.\n")
+		shellWrite(ch, "It is not an outbound email sending platform.\n")
+		shellWrite(ch, "Encrypted chat is optional and meant for coordination.\n")
+		shellWrite(ch, "Type help (or /help). Quick chat note: <user> <message>\n")
+	}
 	for {
-		_, _ = io.WriteString(ch, "sisu> ")
-		line, err := in.ReadString('\n')
+		prompt := env.promptString(state.settings.compact)
+		shellWrite(ch, prompt)
+		line, err := shellReadLine(in, ch, ptyRequested, prompt, &state.editor, env.completeToken)
 		if err != nil {
 			if err == io.EOF {
 				return 0
 			}
 			return 1
 		}
+		rememberHistory(&state.editor, line)
 		kind, a, b := parseRelayShellDirective(line)
 		switch kind {
 		case "noop":
@@ -680,18 +891,42 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 		case "quit":
 			return 0
 		case "help":
-			_, _ = io.WriteString(ch, "Commands:\n")
-			_, _ = io.WriteString(ch, "help\nexamples\nwhoami\nstatus\nlookup <user>\nchatq\nmailq\nquit\n")
-			_, _ = io.WriteString(ch, "You can also prefix commands with / or ¤.\n")
-			_, _ = io.WriteString(ch, "Quick chat send: <user> <message>\n")
+			writeShellHelp(ch, a)
 		case "examples":
-			_, _ = io.WriteString(ch, "Examples:\n")
-			_, _ = io.WriteString(ch, "lookup niklas\n")
-			_, _ = io.WriteString(ch, "niklas hello from hosted shell\n")
-			_, _ = io.WriteString(ch, "status\n")
-			_, _ = io.WriteString(ch, "chatq\n")
+			shellWrite(ch, "Examples:\n")
+			shellWrite(ch, "lookup niklas\n")
+			shellWrite(ch, "niklas hello from hosted shell\n")
+			shellWrite(ch, "status\n")
+			shellWrite(ch, "chatq\n")
+			shellWrite(ch, "set compact on\n")
+		case "clear":
+			if ptyRequested {
+				_, _ = io.WriteString(ch, "\x1b[2J\x1b[H")
+			} else {
+				shellWrite(ch, "\n\n\n")
+			}
+		case "set":
+			key, val, ok := parseSetCommand(a)
+			if !ok {
+				shellWrite(ch, "usage: set compact on|off\n")
+				continue
+			}
+			if key == "compact" {
+				state.settings.compact = val == "on"
+				shellPrintf(ch, "compact=%s\n", val)
+				continue
+			}
+			shellWrite(ch, "usage: set compact on|off\n")
+		case "motd":
+			val, ok := parseOnOff(a)
+			if !ok {
+				shellWrite(ch, "usage: motd on|off\n")
+				continue
+			}
+			state.settings.motd = val == "on"
+			shellPrintf(ch, "motd=%s (session scope)\n", val)
 		case "whoami":
-			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s source=%s\n", env.username, env.source))
+			shellPrintf(ch, "user=%s source=%s\n", env.username, env.source)
 		case "status":
 			chatQueued := 0
 			if env.chatSpool != nil {
@@ -705,78 +940,660 @@ func runHostedShell(ch ssh.Channel, env hostedShellEnv) uint32 {
 					mailQueued = len(list)
 				}
 			}
-			_, _ = io.WriteString(ch, fmt.Sprintf("chat_queue=%d mail_queue=%d\n", chatQueued, mailQueued))
+			shellPrintf(ch, "chat_queue=%d mail_queue=%d\n", chatQueued, mailQueued)
 		case "lookup":
 			target := strings.TrimSpace(a)
 			if target == "" {
-				_, _ = io.WriteString(ch, "usage: ¤lookup <user>\n")
+				shellWrite(ch, "usage: ¤lookup <user>\n")
 				continue
 			}
 			id, err := env.lookup(target)
 			if err != nil {
-				_, _ = io.WriteString(ch, fmt.Sprintf("lookup failed: %v\n", err))
+				shellPrintf(ch, "lookup failed: %v\n", err)
 				continue
 			}
 			if id == nil {
-				_, _ = io.WriteString(ch, "not found\n")
+				shellWrite(ch, "not found\n")
 				continue
 			}
 			online := false
 			if env.reg != nil {
 				_, online = env.reg.GetSession(target)
 			}
-			_, _ = io.WriteString(ch, fmt.Sprintf("user=%s fp=%s online=%v\n", id.Username, id.Fingerprint, online))
+			shellPrintf(ch, "user=%s fp=%s online=%v\n", id.Username, id.Fingerprint, online)
 		case "chatq":
-			if env.chatSpool == nil {
-				_, _ = io.WriteString(ch, "chat queue unavailable\n")
-				continue
-			}
-			list, err := env.chatSpool.List(env.username)
+			qcmd, err := parseChatQCommand(a)
 			if err != nil {
-				_, _ = io.WriteString(ch, fmt.Sprintf("chatq failed: %v\n", err))
+				shellPrintf(ch, "chatq: %v\n", err)
+				shellWrite(ch, "usage: chatq [--full] [--from <user>] [--since <duration>] | chatq read <id> | chatq ack <id>\n")
 				continue
 			}
-			_, _ = io.WriteString(ch, fmt.Sprintf("queued chat messages: %d\n", len(list)))
-			for i := 0; i < len(list) && i < 10; i++ {
-				m := list[i]
-				_, _ = io.WriteString(ch, fmt.Sprintf("%s from=%s bytes=%d at=%s\n", m.ID, m.From, m.SizeBytes, m.ReceivedAt.UTC().Format(time.RFC3339)))
+			if env.chatSpool == nil {
+				shellWrite(ch, "chat queue unavailable\n")
+				continue
+			}
+			switch qcmd.mode {
+			case "read":
+				_, meta, err := env.chatSpool.Get(env.username, qcmd.id)
+				if err != nil {
+					if os.IsNotExist(err) {
+						shellWrite(ch, "chatq read: not found\n")
+					} else {
+						shellPrintf(ch, "chatq read failed: %v\n", err)
+					}
+					continue
+				}
+				shellWrite(ch, "chat message is end-to-end encrypted; relay cannot decrypt content.\n")
+				shellPrintf(ch, "id=%s from=%s bytes=%d at=%s age=%s\n", meta.ID, meta.From, meta.SizeBytes, meta.ReceivedAt.UTC().Format(time.RFC3339), formatRelativeTime(meta.ReceivedAt.UTC(), time.Now().UTC()))
+			case "ack":
+				if err := env.chatSpool.Ack(env.username, qcmd.id); err != nil {
+					shellPrintf(ch, "chatq ack failed: %v\n", err)
+					continue
+				}
+				if env.stats != nil {
+					env.stats.IncChatAcked()
+				}
+				shellPrintf(ch, "acked %s\n", qcmd.id)
+			default:
+				list, err := env.chatSpool.List(env.username)
+				if err != nil {
+					shellPrintf(ch, "chatq failed: %v\n", err)
+					continue
+				}
+				filtered := filterChatQueue(list, qcmd, time.Now().UTC())
+				shellPrintf(ch, "queued chat messages: %d\n", len(filtered))
+				now := time.Now().UTC()
+				for i := 0; i < len(filtered) && i < 10; i++ {
+					m := filtered[i]
+					if qcmd.fullTimestamps {
+						shellPrintf(ch, "%s from=%s bytes=%d at=%s\n", m.ID, m.From, m.SizeBytes, m.ReceivedAt.UTC().Format(time.RFC3339))
+						continue
+					}
+					shellPrintf(ch, "%s from=%s bytes=%d age=%s\n", m.ID, m.From, m.SizeBytes, formatRelativeTime(m.ReceivedAt.UTC(), now))
+				}
 			}
 		case "mailq":
 			if env.spool == nil {
-				_, _ = io.WriteString(ch, "mail queue unavailable\n")
+				shellWrite(ch, "mail queue unavailable\n")
 				continue
 			}
 			list, err := env.spool.List(env.username)
 			if err != nil {
-				_, _ = io.WriteString(ch, fmt.Sprintf("mailq failed: %v\n", err))
+				shellPrintf(ch, "mailq failed: %v\n", err)
 				continue
 			}
-			_, _ = io.WriteString(ch, fmt.Sprintf("queued encrypted mail items: %d\n", len(list)))
-			_, _ = io.WriteString(ch, "mail bodies stay encrypted; use local sisumail client to decrypt/read.\n")
+			shellPrintf(ch, "queued encrypted mail items: %d\n", len(list))
+			shellWrite(ch, "mail bodies stay encrypted; use local sisumail client to decrypt/read.\n")
 		case "send":
 			to := strings.TrimSpace(a)
 			msg := strings.TrimSpace(b)
 			if to == "" || msg == "" {
-				_, _ = io.WriteString(ch, "usage: ¤<user> <message>\n")
+				shellWrite(ch, "usage: ¤<user> <message>\n")
 				continue
 			}
 			mode, err := env.sendHostedChat(to, msg)
 			if err != nil {
-				_, _ = io.WriteString(ch, fmt.Sprintf("send failed: %v\n", err))
+				shellPrintf(ch, "send failed: %v\n", err)
 				continue
 			}
-			switch mode {
-			case "delivered-live":
-				_, _ = io.WriteString(ch, "sent (delivered-live)\n")
-			case "queued-encrypted":
-				_, _ = io.WriteString(ch, "queued-encrypted (recipient can decrypt in local/node mode)\n")
-			default:
-				_, _ = io.WriteString(ch, fmt.Sprintf("sent (%s)\n", mode))
+			renderSendResult(ch, mode)
+		case "reply":
+			id := strings.TrimSpace(a)
+			msg := strings.TrimSpace(b)
+			if id == "" || msg == "" {
+				shellWrite(ch, "usage: reply <id> <message>\n")
+				continue
 			}
+			if env.chatSpool == nil {
+				shellWrite(ch, "chat queue unavailable\n")
+				continue
+			}
+			rc, meta, err := env.chatSpool.Get(env.username, id)
+			if err != nil {
+				if os.IsNotExist(err) {
+					shellWrite(ch, "reply: id not found\n")
+				} else {
+					shellPrintf(ch, "reply failed: %v\n", err)
+				}
+				continue
+			}
+			_ = rc.Close()
+			if strings.TrimSpace(meta.From) == "" {
+				shellWrite(ch, "reply failed: sender missing\n")
+				continue
+			}
+			mode, err := env.sendHostedChat(meta.From, msg)
+			if err != nil {
+				shellPrintf(ch, "reply failed: %v\n", err)
+				continue
+			}
+			renderSendResult(ch, mode)
+		case "unknown":
+			bad := strings.TrimSpace(a)
+			if suggestion := suggestShellCommand(bad); suggestion != "" {
+				shellPrintf(ch, "unknown command: %s (did you mean %s?)\n", bad, suggestion)
+			} else {
+				shellPrintf(ch, "unknown command: %s\n", bad)
+			}
+			shellWrite(ch, "Type help (or /help).\n")
 		default:
-			_, _ = io.WriteString(ch, "unknown command. type ¤help\n")
+			shellWrite(ch, "unknown command. Type help (or /help).\n")
 		}
 	}
+}
+
+func renderSendResult(ch ssh.Channel, mode string) {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "delivered-live":
+		shellWrite(ch, "delivery=delivered-live\n")
+	case "queued-encrypted", "queued":
+		shellWrite(ch, "delivery=queued (recipient can decrypt in local/node mode)\n")
+	default:
+		shellPrintf(ch, "delivery=%s\n", strings.TrimSpace(mode))
+	}
+}
+
+func shellReadLine(in *bufio.Reader, ch ssh.Channel, ptyRequested bool, prompt string, editor *shellEditorState, complete func(string) []string) (string, error) {
+	if in == nil {
+		return "", io.EOF
+	}
+	if !ptyRequested {
+		return in.ReadString('\n')
+	}
+	buf := make([]byte, 0, 128)
+	for {
+		b, err := in.ReadByte()
+		if err != nil {
+			if err == io.EOF && len(buf) > 0 {
+				shellWrite(ch, "\n")
+				return string(buf), nil
+			}
+			return "", err
+		}
+		switch b {
+		case '\r', '\n':
+			shellWrite(ch, "\n")
+			if editor != nil {
+				editor.histIndex = -1
+				editor.draft = ""
+			}
+			return string(buf), nil
+		case 0x7f, 0x08:
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				_, _ = io.WriteString(ch, "\b \b")
+			}
+		case '\t':
+			start, prefix := completionToken(buf)
+			var candidates []string
+			if complete != nil {
+				candidates = complete(prefix)
+			}
+			switch len(candidates) {
+			case 0:
+				_, _ = io.WriteString(ch, "\a")
+			case 1:
+				replacement := []byte(candidates[0] + " ")
+				buf = append(append([]byte{}, buf[:start]...), replacement...)
+				redrawInputLine(ch, prompt, buf)
+			default:
+				shellWrite(ch, "\n")
+				shellWrite(ch, strings.Join(candidates, " ")+"\n")
+				redrawInputLine(ch, prompt, buf)
+			}
+		case 0x1b:
+			// Basic ANSI arrows for history navigation.
+			next, err := in.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if next != '[' {
+				continue
+			}
+			key, err := in.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if editor == nil {
+				continue
+			}
+			switch key {
+			case 'A': // up
+				if len(editor.history) == 0 {
+					continue
+				}
+				if editor.histIndex == -1 {
+					editor.draft = string(buf)
+					editor.histIndex = len(editor.history) - 1
+				} else if editor.histIndex > 0 {
+					editor.histIndex--
+				}
+				buf = []byte(editor.history[editor.histIndex])
+				redrawInputLine(ch, prompt, buf)
+			case 'B': // down
+				if editor.histIndex == -1 {
+					continue
+				}
+				if editor.histIndex < len(editor.history)-1 {
+					editor.histIndex++
+					buf = []byte(editor.history[editor.histIndex])
+				} else {
+					editor.histIndex = -1
+					buf = []byte(editor.draft)
+				}
+				redrawInputLine(ch, prompt, buf)
+			}
+		case 0x03:
+			buf = buf[:0]
+			shellWrite(ch, "^C\n")
+			return "", nil
+		default:
+			// In PTY mode the client expects remote-side echo.
+			if b >= 32 || b == '\t' {
+				buf = append(buf, b)
+				_, _ = ch.Write([]byte{b})
+			}
+		}
+	}
+}
+
+func redrawInputLine(ch ssh.Channel, prompt string, buf []byte) {
+	if ch == nil {
+		return
+	}
+	_, _ = io.WriteString(ch, "\r")
+	_, _ = io.WriteString(ch, prompt)
+	_, _ = ch.Write(buf)
+	_, _ = io.WriteString(ch, "\x1b[K")
+}
+
+func completionToken(buf []byte) (start int, prefix string) {
+	start = len(buf)
+	for start > 0 {
+		if buf[start-1] == ' ' || buf[start-1] == '\t' {
+			break
+		}
+		start--
+	}
+	return start, strings.ToLower(string(buf[start:]))
+}
+
+func shellWrite(ch ssh.Channel, s string) {
+	if ch == nil || s == "" {
+		return
+	}
+	// SSH channels are byte streams, not terminal devices; normalize to CRLF
+	// for predictable cursor positioning in interactive clients.
+	normalized := strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\r\n")
+	_, _ = io.WriteString(ch, normalized)
+}
+
+func shellPrintf(ch ssh.Channel, format string, args ...any) {
+	shellWrite(ch, fmt.Sprintf(format, args...))
+}
+
+func rememberHistory(editor *shellEditorState, line string) {
+	if editor == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return
+	}
+	if len(editor.history) > 0 && editor.history[len(editor.history)-1] == trimmed {
+		return
+	}
+	editor.history = append(editor.history, trimmed)
+	if len(editor.history) > 100 {
+		editor.history = editor.history[len(editor.history)-100:]
+	}
+	editor.histIndex = -1
+	editor.draft = ""
+}
+
+func (env hostedShellEnv) queueCounts() (chatQueued int, mailQueued int) {
+	if env.chatSpool != nil {
+		if list, err := env.chatSpool.List(env.username); err == nil {
+			chatQueued = len(list)
+		}
+	}
+	if env.spool != nil {
+		if list, err := env.spool.List(env.username); err == nil {
+			mailQueued = len(list)
+		}
+	}
+	return chatQueued, mailQueued
+}
+
+func (env hostedShellEnv) promptString(compact bool) string {
+	chatQueued, mailQueued := env.queueCounts()
+	if compact {
+		return fmt.Sprintf("sisu:%s> ", env.username)
+	}
+	return fmt.Sprintf("sisu:%s [c:%d m:%d]> ", env.username, chatQueued, mailQueued)
+}
+
+func (env hostedShellEnv) completeToken(prefix string) []string {
+	p := strings.TrimSpace(strings.ToLower(prefix))
+	set := map[string]struct{}{}
+	add := func(s string) {
+		if strings.HasPrefix(strings.ToLower(s), p) {
+			set[s] = struct{}{}
+		}
+	}
+	for _, c := range shellCompletionWords {
+		add(c)
+	}
+	if strings.HasPrefix("--full", p) {
+		set["--full"] = struct{}{}
+	}
+	if env.store != nil {
+		ids, err := env.store.All(context.Background())
+		if err == nil {
+			for _, id := range ids {
+				add(id.Username)
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func writeShellHelp(ch ssh.Channel, topic string) {
+	switch strings.ToLower(strings.TrimSpace(topic)) {
+	case "", "all":
+		shellWrite(ch, "Commands:\n")
+		shellWrite(ch, "help [command]\nexamples\nwhoami\nstatus\nlookup <user>\nchatq [--full] [--from <user>] [--since <duration>]\nchatq read <id>\nchatq ack <id>\nreply <id> <message>\nmailq\nclear\nset compact on|off\nmotd on|off\nquit\n")
+		shellWrite(ch, "Aliases: ? h (help), stat (status), ls (chatq), q/exit (quit).\n")
+		shellWrite(ch, "You can prefix commands with / or ¤.\n")
+		shellWrite(ch, "Quick chat note: <user> <message>\n")
+		shellWrite(ch, "Sisumail receives mail; outbound internet email sending is out of scope.\n")
+	case "chatq", "ls":
+		shellWrite(ch, "chatq [--full] [--from <user>] [--since <duration>]\n")
+		shellWrite(ch, "Shows up to 10 queued encrypted chat items.\n")
+		shellWrite(ch, "Default output shows relative age; use --full for RFC3339 timestamps.\n")
+		shellWrite(ch, "Subcommands: chatq read <id>, chatq ack <id>\n")
+	case "reply", "r":
+		shellWrite(ch, "reply <id> <message>\n")
+		shellWrite(ch, "Replies to the sender of a queued chat entry.\n")
+	case "lookup", "l":
+		shellWrite(ch, "lookup <user>\n")
+		shellWrite(ch, "Shows fingerprint and online status for a user.\n")
+	case "status", "s", "stat":
+		shellWrite(ch, "status\n")
+		shellWrite(ch, "Shows your chat and mail queue counts.\n")
+	case "whoami", "me":
+		shellWrite(ch, "whoami\n")
+		shellWrite(ch, "Shows authenticated user and source IP.\n")
+	case "mailq":
+		shellWrite(ch, "mailq\n")
+		shellWrite(ch, "Shows queued encrypted mail item count.\n")
+	case "clear", "cls":
+		shellWrite(ch, "clear\n")
+		shellWrite(ch, "Clears terminal screen in interactive sessions.\n")
+	case "set":
+		shellWrite(ch, "set compact on|off\n")
+		shellWrite(ch, "Toggles compact prompt mode for this session.\n")
+	case "motd":
+		shellWrite(ch, "motd on|off\n")
+		shellWrite(ch, "Toggles session message-of-the-day output setting.\n")
+	case "examples", "x":
+		shellWrite(ch, "examples\n")
+		shellWrite(ch, "Shows common command examples.\n")
+	case "quit", "q", "exit":
+		shellWrite(ch, "quit\n")
+		shellWrite(ch, "Ends the hosted shell session.\n")
+	default:
+		if suggestion := suggestShellCommand(topic); suggestion != "" {
+			shellPrintf(ch, "unknown help topic: %s (did you mean %s?)\n", strings.TrimSpace(topic), suggestion)
+		} else {
+			shellPrintf(ch, "unknown help topic: %s\n", strings.TrimSpace(topic))
+		}
+	}
+}
+
+func parseSetCommand(raw string) (key string, val string, ok bool) {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(raw)))
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	if fields[0] != "compact" {
+		return "", "", false
+	}
+	onOff, ok := parseOnOff(fields[1])
+	if !ok {
+		return "", "", false
+	}
+	return fields[0], onOff, true
+}
+
+type chatQCommand struct {
+	mode           string
+	id             string
+	fromUser       string
+	since          time.Duration
+	fullTimestamps bool
+}
+
+func parseChatQCommand(raw string) (chatQCommand, error) {
+	cmd := chatQCommand{mode: "list"}
+	parts := strings.Fields(strings.TrimSpace(raw))
+	if len(parts) == 0 {
+		return cmd, nil
+	}
+	switch strings.ToLower(parts[0]) {
+	case "read":
+		if len(parts) != 2 {
+			return cmd, fmt.Errorf("usage: chatq read <id>")
+		}
+		cmd.mode = "read"
+		cmd.id = strings.TrimSpace(parts[1])
+		if cmd.id == "" {
+			return cmd, fmt.Errorf("empty id")
+		}
+		return cmd, nil
+	case "ack":
+		if len(parts) != 2 {
+			return cmd, fmt.Errorf("usage: chatq ack <id>")
+		}
+		cmd.mode = "ack"
+		cmd.id = strings.TrimSpace(parts[1])
+		if cmd.id == "" {
+			return cmd, fmt.Errorf("empty id")
+		}
+		return cmd, nil
+	}
+	for i := 0; i < len(parts); i++ {
+		switch parts[i] {
+		case "--full":
+			cmd.fullTimestamps = true
+		case "--from":
+			if i+1 >= len(parts) {
+				return cmd, fmt.Errorf("missing value for --from")
+			}
+			i++
+			cmd.fromUser = strings.ToLower(strings.TrimSpace(parts[i]))
+			if cmd.fromUser == "" {
+				return cmd, fmt.Errorf("empty --from value")
+			}
+		case "--since":
+			if i+1 >= len(parts) {
+				return cmd, fmt.Errorf("missing value for --since")
+			}
+			i++
+			d, err := parseSinceDuration(parts[i])
+			if err != nil {
+				return cmd, fmt.Errorf("bad --since: %v", err)
+			}
+			cmd.since = d
+		default:
+			return cmd, fmt.Errorf("unknown option %q", parts[i])
+		}
+	}
+	return cmd, nil
+}
+
+func parseSinceDuration(s string) (time.Duration, error) {
+	raw := strings.ToLower(strings.TrimSpace(s))
+	if raw == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if strings.HasSuffix(raw, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(raw, "d"))
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid day duration")
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("duration must be >= 0")
+	}
+	return d, nil
+}
+
+func filterChatQueue(list []chatqueue.Meta, cmd chatQCommand, now time.Time) []chatqueue.Meta {
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]chatqueue.Meta, 0, len(list))
+	for _, m := range list {
+		if cmd.fromUser != "" && !strings.EqualFold(strings.TrimSpace(m.From), cmd.fromUser) {
+			continue
+		}
+		if cmd.since > 0 && now.Sub(m.ReceivedAt.UTC()) > cmd.since {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func parseOnOff(raw string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "on":
+		return "on", true
+	case "off":
+		return "off", true
+	default:
+		return "", false
+	}
+}
+
+func formatRelativeTime(t, now time.Time) string {
+	d := now.Sub(t)
+	future := d < 0
+	if future {
+		d = -d
+	}
+	var unit string
+	var n int64
+	switch {
+	case d < 10*time.Second:
+		if future {
+			return "in a moment"
+		}
+		return "just now"
+	case d < time.Minute:
+		unit = "s"
+		n = int64(d / time.Second)
+	case d < time.Hour:
+		unit = "m"
+		n = int64(d / time.Minute)
+	case d < 24*time.Hour:
+		unit = "h"
+		n = int64(d / time.Hour)
+	default:
+		unit = "d"
+		n = int64(d / (24 * time.Hour))
+	}
+	if future {
+		return fmt.Sprintf("in %d%s", n, unit)
+	}
+	return fmt.Sprintf("%d%s ago", n, unit)
+}
+
+var shellCommandWords = []string{
+	"help", "examples", "whoami", "status", "lookup", "chatq", "reply", "mailq", "clear", "set", "motd", "quit",
+}
+
+var shellCompletionWords = []string{
+	"help", "examples", "whoami", "status", "stat", "lookup", "chatq", "read", "ack", "reply", "r", "mailq", "ls", "clear", "set", "motd", "quit", "exit", "?", "h", "--full", "--from", "--since",
+}
+
+func suggestShellCommand(in string) string {
+	word := strings.ToLower(strings.TrimSpace(in))
+	if word == "" {
+		return ""
+	}
+	best := ""
+	bestDist := 99
+	for _, candidate := range shellCommandWords {
+		if strings.HasPrefix(candidate, word) || strings.HasPrefix(word, candidate) {
+			if len(word) > 1 {
+				return candidate
+			}
+		}
+		d := levenshteinDistance(word, candidate)
+		if d < bestDist {
+			best = candidate
+			bestDist = d
+		}
+	}
+	if bestDist <= 2 {
+		return best
+	}
+	return ""
+}
+
+func levenshteinDistance(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := 0; j <= len(b); j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			ins := curr[j-1] + 1
+			del := prev[j] + 1
+			sub := prev[j-1] + cost
+			curr[j] = minInt(ins, del, sub)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(b)]
+}
+
+func minInt(v int, rest ...int) int {
+	m := v
+	for _, n := range rest {
+		if n < m {
+			m = n
+		}
+	}
+	return m
 }
 
 func (env hostedShellEnv) lookup(username string) (*identity.Identity, error) {
@@ -823,9 +1640,12 @@ func parseRelayShellDirective(line string) (kind string, arg1 string, arg2 strin
 	if s == "" {
 		return "noop", "", ""
 	}
+	prefix := ""
 	if strings.HasPrefix(s, "¤") {
+		prefix = "¤"
 		s = strings.TrimSpace(strings.TrimPrefix(s, "¤"))
 	} else if strings.HasPrefix(s, "/") {
+		prefix = "/"
 		s = strings.TrimSpace(strings.TrimPrefix(s, "/"))
 	}
 	if s == "" {
@@ -839,26 +1659,37 @@ func parseRelayShellDirective(line string) (kind string, arg1 string, arg2 strin
 	switch cmd {
 	case "q", "quit", "exit":
 		return "quit", "", ""
-	case "help", "h":
-		return "help", "", ""
+	case "?", "help", "h":
+		return "help", strings.TrimSpace(strings.TrimPrefix(s, parts[0])), ""
 	case "examples", "x":
 		return "examples", "", ""
 	case "whoami", "me":
 		return "whoami", "", ""
-	case "status", "s":
+	case "status", "s", "stat":
 		return "status", "", ""
 	case "lookup", "l":
 		if len(parts) < 2 {
 			return "lookup", "", ""
 		}
 		return "lookup", parts[1], ""
-	case "chatq":
-		return "chatq", "", ""
+	case "chatq", "ls":
+		return "chatq", strings.TrimSpace(strings.TrimPrefix(s, parts[0])), ""
+	case "reply", "r":
+		if len(parts) < 3 {
+			return "reply", "", ""
+		}
+		return "reply", parts[1], strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(s, parts[0])), parts[1]))
 	case "mailq":
 		return "mailq", "", ""
+	case "clear", "cls":
+		return "clear", "", ""
+	case "set":
+		return "set", strings.TrimSpace(strings.TrimPrefix(s, parts[0])), ""
+	case "motd":
+		return "motd", strings.TrimSpace(strings.TrimPrefix(s, parts[0])), ""
 	default:
-		if len(parts) < 2 {
-			return "send", cmd, ""
+		if len(parts) < 2 || prefix == "/" {
+			return "unknown", cmd, ""
 		}
 		msg := strings.TrimSpace(strings.TrimPrefix(s, parts[0]))
 		return "send", cmd, msg
@@ -933,11 +1764,29 @@ func remoteIPString(addr net.Addr) string {
 	return addr.String()
 }
 
-var usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+func sourceBucket(addr net.Addr) string {
+	host := remoteIPString(addr)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "unknown"
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		m := net.CIDRMask(24, 32)
+		netIP := ip4.Mask(m)
+		return "v4:" + (&net.IPNet{IP: netIP, Mask: m}).String()
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return "unknown"
+	}
+	m := net.CIDRMask(64, 128)
+	netIP := ip16.Mask(m)
+	return "v6:" + (&net.IPNet{IP: netIP, Mask: m}).String()
+}
 
 func isLookupUsernameAllowed(u string) bool {
-	u = strings.TrimSpace(strings.ToLower(u))
-	if !usernamePattern.MatchString(u) {
+	u, err := identity.CanonicalUsername(u)
+	if err != nil {
 		return false
 	}
 	if isReservedUsername(u) {
