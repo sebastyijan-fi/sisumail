@@ -589,6 +589,53 @@ func main() {
 			APIListen:          strings.TrimSpace(*apiListen),
 			StartedAt:          time.Now().UTC(),
 		}
+		claimFn := localClaimFn(func(username, inviteCode, relayAddr string) (string, string, []string, error) {
+			username = strings.TrimSpace(username)
+			inviteCode = strings.TrimSpace(inviteCode)
+			relayAddr = strings.TrimSpace(relayAddr)
+			if username == "" || inviteCode == "" || relayAddr == "" {
+				return "", "", nil, fmt.Errorf("missing username/invite/relay")
+			}
+			// Separate SSH session as user "claim" to avoid mixing with the normal inbox session.
+			sshCfg := &ssh.ClientConfig{
+				User:            "claim",
+				Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+				HostKeyCallback: hostKeyCB,
+				Timeout:         10 * time.Second,
+			}
+			c, err := ssh.Dial("tcp", relayAddr, sshCfg)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("ssh dial: %w", err)
+			}
+			defer c.Close()
+			ch, reqs, err := c.OpenChannel("claim-v1", nil)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("claim channel: %w", err)
+			}
+			go ssh.DiscardRequests(reqs)
+			pubText := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+			if err := proto.WriteClaimRequest(ch, proto.ClaimRequest{
+				Username:   username,
+				PubKeyText: pubText,
+				InviteCode: inviteCode,
+			}); err != nil {
+				_ = ch.Close()
+				return "", "", nil, fmt.Errorf("claim request: %w", err)
+			}
+			resp, err := proto.ReadClaimResponse(ch)
+			_ = ch.Close()
+			if err != nil {
+				return "", "", nil, fmt.Errorf("claim response: %w", err)
+			}
+			if !resp.OK {
+				return "", "", nil, fmt.Errorf("%s", resp.Message)
+			}
+			addr := strings.TrimSpace(resp.Address)
+			if addr == "" {
+				addr = "inbox@" + resp.Username + "." + strings.TrimSuffix(*zone, ".")
+			}
+			return resp.Username, addr, resp.Invites, nil
+		})
 		go func() {
 			sendChatFn := func(toUser, message string) error {
 				if err := ensurePeerAllowed(contacts, toUser); err != nil {
@@ -602,7 +649,7 @@ func main() {
 				}
 				return nil
 			}
-			if err := runLocalAPIServer(ctx, strings.TrimSpace(*apiListen), token, strings.TrimSpace(*apiTokenPath), strings.TrimSpace(*activeProfilePath), home, status, sendChatFn); err != nil {
+			if err := runLocalAPIServer(ctx, strings.TrimSpace(*apiListen), token, strings.TrimSpace(*apiTokenPath), strings.TrimSpace(*activeProfilePath), home, status, sendChatFn, claimFn); err != nil {
 				log.Printf("local api server error: %v", err)
 				cancel()
 			}
@@ -1398,7 +1445,15 @@ func openProfileContext(home, profile string) (*profileContext, error) {
 	}, nil
 }
 
-func runLocalAPIServer(ctx context.Context, addr, token, tokenPath, activeProfilePath, home string, status localAPIStatus, sendChatFn func(string, string) error) error {
+type localClaimFn func(username, inviteCode, relayAddr string) (claimedUser string, address string, childInvites []string, err error)
+
+func runLocalAPIServer(
+	ctx context.Context,
+	addr, token, tokenPath, activeProfilePath, home string,
+	status localAPIStatus,
+	sendChatFn func(string, string) error,
+	claimFn localClaimFn,
+) error {
 	if strings.TrimSpace(addr) == "" {
 		return nil
 	}
@@ -1487,6 +1542,92 @@ func runLocalAPIServer(ctx context.Context, addr, token, tokenPath, activeProfil
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "profile": p, "restart_required": true})
+	}
+
+	writeProfileUserConfig := func(profile, user, relay, zone string) error {
+		p := normalizeProfileName(profile)
+		if p == "" {
+			return fmt.Errorf("invalid profile")
+		}
+		user = strings.TrimSpace(user)
+		relay = strings.TrimSpace(relay)
+		zone = strings.TrimSpace(zone)
+		if user == "" || relay == "" || zone == "" {
+			return fmt.Errorf("missing user/relay/zone")
+		}
+		def := defaultsForProfile(home, p)
+		if err := os.MkdirAll(filepath.Dir(def.ConfigPath), 0700); err != nil {
+			return err
+		}
+		// Keep this minimal: these 3 are the identity anchor for the client.
+		body := "user=" + user + "\n" +
+			"relay=" + relay + "\n" +
+			"zone=" + zone + "\n"
+		return os.WriteFile(def.ConfigPath, []byte(body), 0600)
+	}
+
+	claimHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if claimFn == nil {
+			http.Error(w, "claim unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			Profile    string `json:"profile"`
+			Username   string `json:"username"`
+			InviteCode string `json:"invite_code"`
+			Relay      string `json:"relay"`
+			Zone       string `json:"zone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json body", http.StatusBadRequest)
+			return
+		}
+		p := normalizeProfileName(req.Profile)
+		if p == "" {
+			p = normalizeProfileName(req.Username)
+		}
+		if p == "" {
+			p = "default"
+		}
+		u := strings.TrimSpace(req.Username)
+		code := strings.TrimSpace(req.InviteCode)
+		relay := strings.TrimSpace(req.Relay)
+		if relay == "" {
+			relay = status.Relay
+		}
+		zone := strings.TrimSpace(req.Zone)
+		if zone == "" {
+			zone = strings.TrimSpace(profileZone(home, status.Profile))
+			if zone == "" {
+				zone = "sisumail.fi"
+			}
+		}
+		if u == "" || code == "" {
+			http.Error(w, "missing username/invite_code", http.StatusBadRequest)
+			return
+		}
+		claimed, addr, invites, err := claimFn(u, code, relay)
+		if err != nil {
+			http.Error(w, "claim failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := writeProfileUserConfig(p, claimed, relay, zone); err != nil {
+			http.Error(w, "claim ok but local config write failed", http.StatusInternalServerError)
+			return
+		}
+		_ = writeActiveProfile(activeProfilePath, p)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":               true,
+			"profile":          p,
+			"username":         claimed,
+			"address":          addr,
+			"child_invites":    invites,
+			"restart_required": true,
+		})
 	}
 	inboxHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1853,6 +1994,7 @@ func runLocalAPIServer(ctx context.Context, addr, token, tokenPath, activeProfil
 	appMux.HandleFunc("/app/v1/chat/contacts/remove", chatContactsMutateHandler(false))
 	appMux.HandleFunc("/app/v1/alias/block", aliasBlockHandler)
 	appMux.HandleFunc("/app/v1/alias/unblock", aliasUnblockHandler)
+	appMux.HandleFunc("/app/v1/claim", claimHandler)
 
 	appWithSession := withAppSessionToken(appSessionToken, appMux)
 	loopbackOnlyApp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1869,10 +2011,27 @@ func runLocalAPIServer(ctx context.Context, addr, token, tokenPath, activeProfil
 			http.NotFound(w, r)
 			return
 		}
+		// First-run: if no user configured yet, send them to onboarding.
+		if strings.TrimSpace(profileUser(home, status.Profile)) == "" {
+			http.Redirect(w, r, "/app/onboard", http.StatusFound)
+			return
+		}
 		http.Redirect(w, r, "/app/inbox", http.StatusFound)
 	})
 	rootMux.HandleFunc("/app", func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(profileUser(home, status.Profile)) == "" {
+			http.Redirect(w, r, "/app/onboard", http.StatusFound)
+			return
+		}
 		http.Redirect(w, r, "/app/inbox", http.StatusFound)
+	})
+	rootMux.HandleFunc("/app/onboard", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, strings.ReplaceAll(localOnboardAppHTML, "__APP_SESSION_TOKEN__", appSessionToken))
 	})
 	rootMux.HandleFunc("/app/inbox", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1911,6 +2070,22 @@ func runLocalAPIServer(ctx context.Context, addr, token, tokenPath, activeProfil
 		return nil
 	}
 	return err
+}
+
+func profileZone(home, profile string) string {
+	p := normalizeProfileName(profile)
+	if p == "default" {
+		cfg, err := readConfigFile(filepath.Join(home, ".config", "sisumail", "config.env"))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(cfg["zone"])
+	}
+	cfg, err := readConfigFile(filepath.Join(home, ".config", "sisumail", "profiles", p, "config.env"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg["zone"])
 }
 
 type apiMessageView struct {
@@ -2153,6 +2328,119 @@ const localAppHomeHTML = `<!doctype html>
         document.getElementById('chip-tls').textContent = 'Unknown';
       }
     })();
+  </script>
+</body>
+</html>`
+
+const localOnboardAppHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sisu Mail Setup</title>
+  <style>
+    :root { --sand:#f7f2e7; --ink:#1f1a17; --muted:#655d56; --line:#d9cfbe; --card:#fff9ef; --mint:#1b7d64; --mint2:#0f5f4b; --sky:#dbeeff; --bad:#922; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); font-family:"Avenir Next","Trebuchet MS","Segoe UI",sans-serif; background:radial-gradient(1000px 420px at 15% -10%, #fff9da 0%, transparent 65%),radial-gradient(900px 320px at 88% -8%, #d9f2e8 0%, transparent 62%),var(--sand); }
+    .wrap { max-width:820px; margin:0 auto; padding:26px; }
+    .title { margin:0; font-size:38px; } .sub { margin:8px 0 0; color:var(--muted); font-size:18px; }
+    .card { margin-top:14px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:18px; box-shadow:0 1px 0 rgba(0,0,0,.03); }
+    label { display:block; font-size:12px; color:var(--muted); margin-top:12px; }
+    input { width:100%; font:inherit; border:1px solid var(--line); border-radius:12px; padding:10px 12px; background:white; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .chips { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .chip { background:#f0eadc; border:1px solid var(--line); border-radius:999px; padding:6px 10px; font-size:12px; }
+    .chip.good { background:#e6f7f1; border-color:#b7e3d7; color:#0f5f4b; }
+    .chip.bad { background:#fff1f1; border-color:#f2c7c7; color:var(--bad); }
+    button { margin-top:14px; font:inherit; border-radius:12px; padding:10px 12px; border:none; cursor:pointer; }
+    button.primary { background:linear-gradient(180deg,var(--mint),var(--mint2)); color:white; }
+    button.ghost { background:transparent; border:1px solid var(--line); }
+    pre { margin:12px 0 0; white-space:pre-wrap; word-break:break-word; background:white; border:1px dashed var(--line); border-radius:12px; padding:12px; }
+    .muted { color:var(--muted); }
+    @media (max-width: 760px) { .row { grid-template-columns:1fr; } .title { font-size:32px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">Set up Sisumail</h1>
+    <p class="sub">Claim a username with an invite code. After that, this device can receive mail for it.</p>
+
+    <div class="chips">
+      <span id="chip-conn" class="chip">Checking relay...</span>
+      <span class="chip">Receive-only</span>
+      <span class="chip">Local-first</span>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Username</label>
+          <input id="u" placeholder="sebastyijan" autocomplete="off" />
+        </div>
+        <div>
+          <label>Invite code</label>
+          <input id="code" placeholder="XXXXXXXXXXXXXXX" autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Relay</label>
+          <input id="relay" placeholder="sisumail.fi:2222" autocomplete="off" />
+        </div>
+        <div>
+          <label>Zone</label>
+          <input id="zone" placeholder="sisumail.fi" autocomplete="off" />
+        </div>
+      </div>
+      <button id="go" class="primary">Claim And Set Up This Device</button>
+      <div id="out" class="muted" style="margin-top:10px"></div>
+      <pre id="next" style="display:none"></pre>
+      <div style="margin-top:10px"><a class="muted" href="/app/inbox">Skip to inbox</a></div>
+    </div>
+  </div>
+  <script>
+    const APP_SESSION_TOKEN = '__APP_SESSION_TOKEN__';
+    const out = document.getElementById('out');
+    const next = document.getElementById('next');
+    function esc(s){ return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+    async function api(path, opts={}) {
+      const o = { ...opts, headers: { ...(opts.headers || {}), 'X-Sisu-App-Token': APP_SESSION_TOKEN } };
+      const r = await fetch(path, o);
+      const t = await r.text();
+      if (!r.ok) throw new Error(t || String(r.status));
+      return t ? JSON.parse(t) : {};
+    }
+    async function boot() {
+      try {
+        const j = await api('/app/v1/status');
+        document.getElementById('relay').value = j.relay || 'sisumail.fi:2222';
+        document.getElementById('zone').value = (j.relay || '').includes('sisumail.fi') ? 'sisumail.fi' : 'sisumail.fi';
+        const chip = document.getElementById('chip-conn');
+        chip.textContent = 'Relay reachable';
+        chip.className = 'chip good';
+      } catch (e) {
+        const chip = document.getElementById('chip-conn');
+        chip.textContent = 'Relay not reachable';
+        chip.className = 'chip bad';
+      }
+    }
+    document.getElementById('go').addEventListener('click', async () => {
+      out.textContent = 'Claiming...';
+      next.style.display = 'none';
+      try {
+        const username = document.getElementById('u').value.trim();
+        const invite_code = document.getElementById('code').value.trim();
+        const relay = document.getElementById('relay').value.trim();
+        const zone = document.getElementById('zone').value.trim();
+        const j = await api('/app/v1/claim', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, invite_code, relay, zone }) });
+        out.innerHTML = 'Claimed <b>' + esc(j.username) + '</b>. Your address is <b>' + esc(j.address) + '</b>.';
+        next.style.display = 'block';
+        next.textContent = 'Next: restart sisumail (so it starts as ' + j.username + ').\\n\\nAfter restart, open:\\n  http://127.0.0.1:3490/app\\n';
+      } catch (e) {
+        out.textContent = String(e || 'claim failed');
+      }
+    });
+    boot();
   </script>
 </body>
 </html>`
