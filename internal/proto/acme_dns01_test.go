@@ -9,7 +9,7 @@ func TestACMEDNS01RoundTrip(t *testing.T) {
 	var b strings.Builder
 	req := ACMEDNS01Request{
 		Op:       "present",
-		Hostname: "v6.alice.sisumail.fi",
+		Hostname: "alice.v6.sisumail.fi",
 		Value:    "abc123",
 	}
 	if err := WriteACMEDNS01Request(&b, req); err != nil {

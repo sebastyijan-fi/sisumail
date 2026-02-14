@@ -44,7 +44,7 @@ type DNSRRSet struct {
 	Type   string   // MX, AAAA, TXT, CAA
 	Name   string   // FQDN or relative label; provider may normalize
 	TTL    int      // seconds, 0 = provider default
-	Values []string // RR values (e.g. MX: "10 v6.user.zone.", "20 spool.zone.")
+	Values []string // RR values (e.g. MX: "10 user.v6.zone.", "20 spool.zone.")
 }
 
 // DNSProvider manages DNS records via a hosting API (RRSet-based).

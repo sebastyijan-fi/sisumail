@@ -22,9 +22,9 @@ type Provisioner struct {
 //
 // Records created (per whitepaper §7):
 //
-//	MX    <u>.sisumail.fi  →  10 v6.<u>.sisumail.fi.       (Tier 1)
+//	MX    <u>.sisumail.fi  →  10 <u>.v6.sisumail.fi.       (Tier 1)
 //	MX    <u>.sisumail.fi  →  20 spool.sisumail.fi.        (Tier 2 fallback)
-//	AAAA  v6.<u>.sisumail.fi  →  <destIPv6>                (Tier 1 destination)
+//	AAAA  <u>.v6.sisumail.fi  →  <destIPv6>                (Tier 1 destination, served dynamically)
 //	TXT   <u>.sisumail.fi  →  v=spf1 -all                  (receive-only SPF)
 //	CAA   <u>.sisumail.fi  →  0 issue "letsencrypt.org"    (ACME CA restriction)
 func (p *Provisioner) ProvisionUser(username string, destIPv6 net.IP) error {
@@ -34,7 +34,7 @@ func (p *Provisioner) ProvisionUser(username string, destIPv6 net.IP) error {
 	}
 
 	userDomain := fmt.Sprintf("%s.%s", username, p.ZoneName)
-	tier1Host := fmt.Sprintf("v6.%s.%s", username, p.ZoneName)
+	tier1Host := fmt.Sprintf("%s.v6.%s", username, p.ZoneName)
 
 	rrsets := []core.DNSRRSet{
 		{
@@ -43,7 +43,6 @@ func (p *Provisioner) ProvisionUser(username string, destIPv6 net.IP) error {
 			TTL:    300,
 			Values: []string{fmt.Sprintf("10 %s.", tier1Host), fmt.Sprintf("20 spool.%s.", p.ZoneName)},
 		},
-		{Type: "AAAA", Name: tier1Host, TTL: 300, Values: []string{destIPv6.String()}},
 		// Hetzner Console DNS requires TXT record values to include the surrounding quotes.
 		{Type: "TXT", Name: userDomain, TTL: 3600, Values: []string{`"v=spf1 -all"`}},
 		{Type: "CAA", Name: userDomain, TTL: 3600, Values: []string{`0 issue "letsencrypt.org"`}},
@@ -67,7 +66,6 @@ func (p *Provisioner) DeprovisionUser(username string) error {
 	}
 
 	userDomain := fmt.Sprintf("%s.%s", username, p.ZoneName)
-	tier1Host := fmt.Sprintf("v6.%s.%s", username, p.ZoneName)
 
 	// Delete RRSets we manage for this user.
 	for _, rr := range []struct {
@@ -75,7 +73,6 @@ func (p *Provisioner) DeprovisionUser(username string) error {
 		typ  string
 	}{
 		{name: userDomain, typ: "MX"},
-		{name: tier1Host, typ: "AAAA"},
 		{name: userDomain, typ: "TXT"},
 		{name: userDomain, typ: "CAA"},
 	} {

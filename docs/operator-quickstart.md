@@ -4,13 +4,21 @@ This is a **relay operator** guide: you run the infrastructure for a domain (DNS
 
 If you only want to run a personal always-on node that connects to an existing relay, you do **not** need this doc (node mode docs not written yet).
 
+## Core Product Message (Use This Wording)
+
+When users ask what Sisumail is, keep it simple:
+
+- Sisumail is sovereign **mail receive** infrastructure.
+- It is **not** an outbound email sending platform.
+- Optional encrypted chat exists for coordination.
+
 ## Current Reality (Read First)
 
 Working today:
 - Tier 1 proxy + SSH gateway (dev ports by default).
 - Identity registry (SQLite) and first-come claim semantics.
 - Hetzner Console DNS (Cloud API) provisioning exists and is wired into the relay **if** env vars are present.
-- Product SSH endpoint on `:22` with admin OpenSSH on `:22222` can be run safely.
+- Product SSH gateway on `:2222` with admin OpenSSH on `:22` can be run safely.
 
 Not production-ready yet:
 - Full observability stack (metrics endpoint, alerting policy, SLO dashboards) is not complete.
@@ -24,9 +32,11 @@ Operators should communicate mode/trust expectations clearly:
 - Easiest access path.
 - Relay-hosted interface logic; higher relay trust.
 - No local repo clone is required for this mode.
+- Good for first login and recovery.
 
 2. Local session (`sisumail` client on user machine)
 - Stronger privacy boundary; local endpoint handles keys/decryption/storage.
+- Recommended day-to-day mode.
 
 3. Personal node
 - User-managed always-on endpoint for maximum control.
@@ -43,11 +53,32 @@ Operators should communicate mode/trust expectations clearly:
 
 Per user `<u>` you will publish:
 
-- `MX 10 v6.<u>.<zone>` (Tier 1)
+- `MX 10 <u>.v6.<zone>` (Tier 1)
 - `MX 20 spool.<zone>` (Tier 2 fallback)
-- `AAAA v6.<u>.<zone> -> <unique per-user IPv6>`
+- `AAAA <u>.v6.<zone> -> <unique per-user IPv6>` (served by `sisumail-dns`)
 
 Templates: see `docs/dns-records.md`.
+
+## 1b) Publish `/.well-known/sisu-node`
+
+v1 discovery should expose authoritative node metadata at:
+
+```text
+https://<your-domain>/.well-known/sisu-node
+```
+
+Generate the JSON artifact:
+
+```bash
+scripts/generate_well_known_sisu_node.sh \
+  --domain sisumail.fi \
+  --node-public-key <base64-ed25519-node-pubkey> \
+  --ssh-endpoint sisumail.fi:2222 \
+  --tier2-smtp spool.sisumail.fi:25 \
+  --out /var/www/sisumail/.well-known/sisu-node
+```
+
+Template reference: `deploy/well-known/sisu-node.example.json`.
 
 ## 2) Enable IPv6 AnyIP (Tier 1 ingress)
 
@@ -62,9 +93,15 @@ sysctl -w net.ipv6.ip_nonlocal_bind=1
 
 Provider mode warning:
 - If your /64 is L3-routed to the host, this works without per-/128 NDP.
-- If your provider treats the /64 as on-link, you may need `ndppd` or explicit /128 assignment.
+- If your provider treats the /64 as on-link (Hetzner-style), you need `ndppd` or explicit /128 assignment.
 
 You must validate this with an external connectivity test before going live on port 25.
+
+One-command helper for on-link /64s (installs `ndppd`, sysctls, AnyIP route, and sets Tier 1 listen to IPv6 `:25`):
+
+```bash
+scripts/vps_enable_tier1_anyip.sh --host <your-vps-ip>
+```
 
 ## 3) Install Dependencies
 
@@ -107,7 +144,7 @@ chmod 700 /var/lib/sisumail
 
 ## 7) Configure Secrets (Hetzner Console DNS Token)
 
-Create `/etc/sisumail.env` with mode `0600`:
+Create `/etc/sisumail.env` with restricted perms (recommended: `0640 root:sisu`):
 
 ```bash
 cat > /etc/sisumail.env <<EOF
@@ -122,6 +159,9 @@ SISUMAIL_TIER2_DENYLIST_PATH=/etc/sisumail-tier2-denylist.txt
 SISUMAIL_TIER2_MAX_CONNS_PER_SOURCE=20
 SISUMAIL_TIER2_MAX_MSGS_PER_SOURCE_PER_MIN=60
 SISUMAIL_OBS_LISTEN=127.0.0.1:9090     # relay health/readiness/metrics HTTP
+SISUMAIL_WELL_KNOWN_LISTEN=:8080        # optional public discovery HTTP listener
+SISUMAIL_WELL_KNOWN_PATH=/.well-known/sisu-node
+SISUMAIL_WELL_KNOWN_FILE=/etc/sisumail/sisu-node.json
 SISUMAIL_TIER1_FAST_FAIL_MS=200        # quick offline failover to MX 20
 SISUMAIL_TIER1_OPEN_TIMEOUT_MS=3000    # SSH smtp-delivery channel open timeout
 SISUMAIL_TIER1_IDLE_TIMEOUT_MS=120000  # idle TCP/SSH pipe timeout
@@ -131,7 +171,8 @@ SISUMAIL_TIER1_MAX_CONNS_PER_USER=10
 SISUMAIL_TIER1_MAX_CONNS_PER_SOURCE=20
 SISUMAIL_ACME_DNS01_PER_USER_PER_MIN=30
 EOF
-chmod 0600 /etc/sisumail.env
+chown root:sisu /etc/sisumail.env
+chmod 0640 /etc/sisumail.env
 ```
 
 Quick validity check (must return `200`):
@@ -194,6 +235,12 @@ Once nameservers have propagated and the token is valid:
 
 - Connect as a new username with a new SSH key (first-come claim).
 - The relay should allocate an IPv6 from your /64 and create DNS records for that user.
+- For open first-claim, keep claim rate limits enabled (defaults are conservative). Tuning knobs:
+- `SISUMAIL_CLAIM_PER_SOURCE_PER_HOUR` (default `3`)
+- `SISUMAIL_CLAIM_PER_SOURCE_PER_DAY` (default `12`)
+- `SISUMAIL_CLAIM_GLOBAL_PER_HOUR` (default `200`)
+- `SISUMAIL_CLAIM_GLOBAL_PER_DAY` (default `1000`)
+- `SISUMAIL_CLAIM_LOG_RETENTION_DAYS` (default `30`)
 
 Inspect relay logs:
 
@@ -207,6 +254,7 @@ Observe service health locally:
 curl -fsS http://127.0.0.1:9090/-/healthz
 curl -fsS http://127.0.0.1:9090/-/readyz
 curl -fsS http://127.0.0.1:9090/metrics | head
+curl -fsS http://127.0.0.1:8080/.well-known/sisu-node
 ```
 
 `/-/readyz` returns `503` until both SSH gateway and Tier 1 listeners are active.
@@ -239,6 +287,20 @@ SSH_USER=<claimed_user> scripts/smoke_hosted_shell_live.sh
 Optional overrides:
 - `ACME_DIR` (default Let’s Encrypt staging)
 - `RELAY_ADDR`, `SMTP_LISTEN`, `ZONE`, `PROP_WAIT`, `TIMEOUT_SECS`
+
+## Go Relay Canary (Parallel Validation)
+
+To run the Go relay in parallel (new ports, isolated state) on a VPS without touching active Python services:
+
+```bash
+scripts/vps_deploy_go_canary.sh --host 77.42.70.19 --user root
+```
+
+Default canary ports:
+- SSH: `3222`
+- Tier 1: `2625`
+- Well-known: `18080`
+- Observability: `127.0.0.1:19090`
 
 ## 10) Production Cutover (Later)
 

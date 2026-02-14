@@ -57,7 +57,7 @@ Sisumail has three planes:
 Users interact via SSH:
 
 ```bash
-ssh <username>@sisumail.fi
+ssh -p 2222 <username>@sisumail.fi
 ```
 
 SSH is the protocol/authentication layer, not a UX limitation. Third-party clients (mobile, desktop, web) can implement richer interfaces while using SSH keys and channel semantics under the hood.
@@ -92,9 +92,15 @@ Sisumail binds identities to SSH Ed25519 keys.
 No signup forms. First key to claim a name binds it.
 
 1. User generates a keypair locally.
-2. User connects: `ssh niklas@sisumail.fi`
+2. User connects: `ssh -p 2222 niklas@sisumail.fi`
 3. If `niklas` is unclaimed and not reserved, the relay binds it to the presented key and provisions DNS/routing.
 4. If claimed by a different key, the connection is rejected.
+
+Abuse controls (v1, open first-claim):
+- Usernames are canonicalized to a single DNS label (lowercase, `a-z0-9-`, no leading/trailing `-`).
+- A small reserved-name list is blocked (`postmaster`, `abuse`, `mail`, `spool`, etc.).
+- A single public key fingerprint can claim only one username (prevents one key squatting many names).
+- Claims are rate-limited (per source bucket and global) and only *new* claims consume the limit.
 
 ### 4.3 Minimal Registry State
 The relay stores only what is needed to route and to encrypt in Tier 2:
@@ -113,16 +119,16 @@ No message content, alias map, or mailbox state is stored in Tier 1.
 ## 5. Addressing and Aliases
 
 ### 5.1 Address Format
-Primary:
+Primary (convention, not a protocol requirement):
 
 ```
-mail@<username>.sisumail.fi
+inbox@<username>.sisumail.fi
 ```
 
-Aliases:
+Aliases (unlimited; same inbox):
 
 ```
-mail+<tag>@<username>.sisumail.fi
+<alias>@<username>.sisumail.fi
 ```
 
 ### 5.2 Alias Intelligence Lives at the Edge
@@ -181,16 +187,16 @@ A single MX hostname with both A and AAAA creates certificate identity problems 
 For user `<u>`:
 
 ```dns
-<u>.sisumail.fi.       MX 10  v6.<u>.sisumail.fi.    ; Tier 1
+<u>.sisumail.fi.       MX 10  <u>.v6.sisumail.fi.    ; Tier 1
 <u>.sisumail.fi.       MX 20  spool.sisumail.fi.     ; Tier 2 fallback
 
-v6.<u>.sisumail.fi.    AAAA   <relay_ipv6_prefix>::<n>     ; unique per-user destination IPv6
+<u>.v6.sisumail.fi.    AAAA   <relay_ipv6_prefix>::<n>     ; unique per-user destination IPv6
 spool.sisumail.fi.     A      <relay-ipv4>
 spool.sisumail.fi.     AAAA   <relay-ipv6-shared>    ; recommended (dual-stack Tier 2)
 ```
 
 Why this matters:
-- Senders connecting to `v6.<u>.sisumail.fi` expect a certificate for that hostname; the user device holds that private key.
+- Senders connecting to `<u>.v6.sisumail.fi` expect a certificate for that hostname; the user device holds that private key.
 - Senders connecting to `spool.sisumail.fi` expect a certificate for that hostname; the relay holds that private key.
 - Tier labeling becomes deterministic and based on actual delivery path.
 
@@ -288,7 +294,7 @@ Tier 2 adds:
 - **Receive-only implications:** by default, SPF can be `-all`. Users should expect that sending mail as a Sisumail address from third-party SMTP will fail SPF/DMARC alignment.
 
 ## 15.1 Scaling Note: DNS Record Volume
-Sisumail's Tier 1 delivery model requires per-user DNS records (at minimum: `MX <u>.<zone>` and `AAAA v6.<u>.<zone>`). This implies that very large deployments create a very large number of DNS objects.
+Sisumail's Tier 1 delivery model requires per-user DNS records (at minimum: `MX <u>.<zone>`). The per-user `AAAA <u>.v6.<zone>` record is served from a delegated programmable DNS zone (e.g. `v6.<zone>`), which reduces record sprawl and operational overhead.
 
 Practical implication:
 - v1 can run comfortably on a managed DNS provider for small to medium scale (hundreds to thousands of users), but "millions of users under one zone on a managed DNS provider" is not a realistic assumption without enterprise arrangements.

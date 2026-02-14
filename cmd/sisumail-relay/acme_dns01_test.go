@@ -60,7 +60,7 @@ func (f *fakeDNS) GetZoneIDByName(zoneName string) (string, error) {
 func TestACMEDNS01ControllerPresentAndCleanup(t *testing.T) {
 	dns := newFakeDNS("sisumail.fi")
 	c := newACMEDNS01Controller("sisumail.fi", dns, 100)
-	host := "v6.alice.sisumail.fi"
+	host := "alice.v6.sisumail.fi"
 	if err := c.present("alice", host, "tok1"); err != nil {
 		t.Fatalf("present: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestACMEDNS01ControllerPresentAndCleanup(t *testing.T) {
 func TestACMEDNS01ControllerRejectsWrongHost(t *testing.T) {
 	dns := newFakeDNS("sisumail.fi")
 	c := newACMEDNS01Controller("sisumail.fi", dns, 100)
-	if err := c.present("alice", "v6.bob.sisumail.fi", "tok1"); err == nil {
+	if err := c.present("alice", "bob.v6.sisumail.fi", "tok1"); err == nil {
 		t.Fatal("expected unauthorized hostname error")
 	}
 }
@@ -94,7 +94,7 @@ func TestACMEDNS01ControllerRejectsWrongHost(t *testing.T) {
 func TestACMEDNS01ControllerRateLimit(t *testing.T) {
 	dns := newFakeDNS("sisumail.fi")
 	c := newACMEDNS01Controller("sisumail.fi", dns, 1)
-	host := "v6.alice.sisumail.fi"
+	host := "alice.v6.sisumail.fi"
 	if err := c.present("alice", host, "tok1"); err != nil {
 		t.Fatalf("first present: %v", err)
 	}

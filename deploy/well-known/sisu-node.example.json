@@ -1,0 +1,21 @@
+{
+  "version": "sisu-v1",
+  "domain": "sisumail.fi",
+  "well_known_url": "https://sisumail.fi/.well-known/sisu-node",
+  "node_public_key": "REPLACE_WITH_BASE64_ED25519_NODE_PUBLIC_KEY",
+  "profiles": [
+    "core-node",
+    "relay-node",
+    "client"
+  ],
+  "endpoints": {
+    "ssh": "sisumail.fi:2222",
+    "tier1_smtp": "<user>.v6.sisumail.fi:25",
+    "tier2_smtp": "spool.sisumail.fi:25",
+    "api": "https://sisumail.fi"
+  },
+  "policy": {
+    "receive_only": true,
+    "outbound_email_supported": false
+  }
+}

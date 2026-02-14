@@ -167,7 +167,7 @@ func TestZonesAndRRSetLifecycle(t *testing.T) {
 		Type:   "MX",
 		Name:   "niklas.sisumail.fi",
 		TTL:    300,
-		Values: []string{"10 v6.niklas.sisumail.fi.", "20 spool.sisumail.fi."},
+		Values: []string{"10 niklas.v6.sisumail.fi.", "20 spool.sisumail.fi."},
 	}
 	if err := c.UpsertRRSet(zid, rr); err != nil {
 		t.Fatalf("UpsertRRSet create: %v", err)
@@ -178,7 +178,7 @@ func TestZonesAndRRSetLifecycle(t *testing.T) {
 	}
 
 	// overwrite (set_records path)
-	rr.Values = []string{"10 v6.niklas.sisumail.fi.", "20 spool.sisumail.fi.", "30 backup.example."}
+	rr.Values = []string{"10 niklas.v6.sisumail.fi.", "20 spool.sisumail.fi.", "30 backup.example."}
 	if err := c.UpsertRRSet(zid, rr); err != nil {
 		t.Fatalf("UpsertRRSet update: %v", err)
 	}

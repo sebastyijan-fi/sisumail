@@ -57,7 +57,7 @@ func (c *acmeDNS01Controller) allowUser(user string) bool {
 
 func (c *acmeDNS01Controller) ensureAuthorizedHost(user, host string) error {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	want := fmt.Sprintf("v6.%s.%s", strings.ToLower(strings.TrimSpace(user)), c.zone)
+	want := fmt.Sprintf("%s.v6.%s", strings.ToLower(strings.TrimSpace(user)), c.zone)
 	if host != want {
 		return fmt.Errorf("unauthorized hostname")
 	}

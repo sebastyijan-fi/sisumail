@@ -93,8 +93,8 @@ func TestProvisionCreatesExpectedRRSets(t *testing.T) {
 	}
 
 	rrs := dns.all("zone-1")
-	if len(rrs) != 4 {
-		t.Fatalf("expected 4 rrsets, got %d", len(rrs))
+	if len(rrs) != 3 {
+		t.Fatalf("expected 3 rrsets, got %d", len(rrs))
 	}
 
 	get := func(name, typ string) *core.DNSRRSet {
@@ -107,14 +107,9 @@ func TestProvisionCreatesExpectedRRSets(t *testing.T) {
 		t.Fatalf("missing MX rrset")
 	}
 	sort.Strings(mx.Values)
-	wantMX := []string{"10 v6.niklas.sisumail.fi.", "20 spool.sisumail.fi."}
+	wantMX := []string{"10 niklas.v6.sisumail.fi.", "20 spool.sisumail.fi."}
 	if strings.Join(mx.Values, "|") != strings.Join(wantMX, "|") {
 		t.Fatalf("MX values got=%v want=%v", mx.Values, wantMX)
-	}
-
-	aaaa := get("v6.niklas.sisumail.fi", "AAAA")
-	if aaaa == nil || len(aaaa.Values) != 1 || aaaa.Values[0] != "2a01:4f8:1234::42" {
-		t.Fatalf("AAAA got=%+v", aaaa)
 	}
 
 	txt := get("niklas.sisumail.fi", "TXT")
