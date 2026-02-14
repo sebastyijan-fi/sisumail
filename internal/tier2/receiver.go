@@ -150,6 +150,15 @@ func (s *session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 	// Look up recipient key.
 	key, err := s.receiver.KeyResolver.Resolve(domain)
 	if err != nil {
+		// If Tier 2 is disabled for this recipient, make it explicit and permanent.
+		// This is the enforcement point for "Tier 2 is optional and opt-in".
+		if strings.Contains(strings.ToLower(err.Error()), "tier2 disabled") {
+			return &gosmtp.SMTPError{
+				Code:         550,
+				EnhancedCode: gosmtp.EnhancedCode{5, 7, 1},
+				Message:      "recipient requires tier1 delivery (tier2 disabled)",
+			}
+		}
 		return &gosmtp.SMTPError{
 			Code:         550,
 			EnhancedCode: gosmtp.EnhancedCode{5, 1, 1},

@@ -55,3 +55,9 @@ Internal code can migrate gradually, but external language should be consistent 
 - Security beats growth shortcuts.
 - Local mode quality must surpass hosted-shell convenience over time.
 - Optional chat remains secondary and must never confuse the product boundary.
+
+## Tier 2 (Compatibility Bridge)
+
+- Tier 1 is the product: the relay becomes content-blind after STARTTLS.
+- Tier 2 exists only for legacy SMTP compatibility and optional offline delivery.
+- Tier 2 is **opt-in per user**. If a user has not enabled Tier 2, Tier 2 MUST reject delivery attempts for that user.

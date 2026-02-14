@@ -15,6 +15,10 @@ type DomainKeyResolver struct {
 	Store   *Store
 	Zone    string
 	Timeout time.Duration
+
+	// AllowTier2Gate enforces per-user opt-in for Tier 2 compatibility ingest.
+	// When true, Resolve rejects recipients whose identity record has AllowTier2=false.
+	AllowTier2Gate bool
 }
 
 func (r *DomainKeyResolver) Resolve(domain string) (string, error) {
@@ -49,6 +53,9 @@ func (r *DomainKeyResolver) Resolve(domain string) (string, error) {
 	}
 	if rec == nil {
 		return "", fmt.Errorf("unknown recipient")
+	}
+	if r.AllowTier2Gate && !rec.AllowTier2 {
+		return "", fmt.Errorf("tier2 disabled for recipient")
 	}
 	return rec.PubKeyText, nil
 }

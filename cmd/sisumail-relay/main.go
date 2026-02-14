@@ -55,6 +55,8 @@ func main() {
 		username               = flag.String("username", "", "identity username for -add-user")
 		pubkeyPath             = flag.String("pubkey", "", "path to SSH public key file for -add-user")
 		ipv6Str                = flag.String("ipv6", "", "IPv6 address for -add-user")
+		allowTier2             = flag.Bool("allow-tier2", false, "operator: enable Tier 2 compatibility ingest for -username")
+		disallowTier2          = flag.Bool("disallow-tier2", false, "operator: disable Tier 2 compatibility ingest for -username")
 		allowClaim             = flag.Bool("allow-claim", false, "allow first-come claim for unknown usernames (requires DNS env vars in production)")
 		mintInvites            = flag.Bool("mint-invites", false, "operator: mint root invite codes and print them to stdout (requires SISUMAIL_INVITE_PEPPER in production)")
 		mintInvitesN           = flag.Int("mint-invites-n", 1, "operator: number of root invite codes to mint when -mint-invites is set")
@@ -115,6 +117,24 @@ func main() {
 		for _, c := range codes {
 			fmt.Println(c)
 		}
+		return
+	}
+
+	if *allowTier2 || *disallowTier2 {
+		if strings.TrimSpace(*username) == "" {
+			log.Fatalf("-allow-tier2/-disallow-tier2 requires -username")
+		}
+		if *allowTier2 && *disallowTier2 {
+			log.Fatalf("choose one: -allow-tier2 or -disallow-tier2")
+		}
+		if err := store.SetAllowTier2(ctx, strings.TrimSpace(*username), *allowTier2); err != nil {
+			log.Fatalf("set allow-tier2: %v", err)
+		}
+		state := "disabled"
+		if *allowTier2 {
+			state = "enabled"
+		}
+		log.Printf("tier2 compatibility %s for %s", state, strings.TrimSpace(*username))
 		return
 	}
 

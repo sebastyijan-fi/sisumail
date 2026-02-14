@@ -64,9 +64,10 @@ func main() {
 	}
 
 	resolver := &identity.DomainKeyResolver{
-		Store:   store,
-		Zone:    *zone,
-		Timeout: 2 * time.Second,
+		Store:           store,
+		Zone:            *zone,
+		Timeout:         2 * time.Second,
+		AllowTier2Gate:  true,
 	}
 
 	spool := &tier2.FileSpool{Root: *spoolDir}

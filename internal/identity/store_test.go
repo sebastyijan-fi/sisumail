@@ -114,6 +114,44 @@ func TestStoreClaim_RateLimits(t *testing.T) {
 	}
 }
 
+func TestStoreAllowTier2Flag(t *testing.T) {
+	ctx := context.Background()
+	s := openTempStore(t)
+	defer s.Close()
+	if err := s.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// Seed identity via Put.
+	_, pub, err := testKeyPair()
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	ip := net.ParseIP("fd00:1::1234")
+	if err := s.Put(ctx, "alice", pub, ip); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	rec, err := s.GetByUsername(ctx, "alice")
+	if err != nil || rec == nil {
+		t.Fatalf("get: rec=%v err=%v", rec, err)
+	}
+	if rec.AllowTier2 {
+		t.Fatalf("expected default AllowTier2=false")
+	}
+
+	if err := s.SetAllowTier2(ctx, "alice", true); err != nil {
+		t.Fatalf("set allow: %v", err)
+	}
+	rec, err = s.GetByUsername(ctx, "alice")
+	if err != nil || rec == nil {
+		t.Fatalf("get2: rec=%v err=%v", rec, err)
+	}
+	if !rec.AllowTier2 {
+		t.Fatalf("expected AllowTier2=true after set")
+	}
+}
+
 func TestStoreClaim_GlobalLimit(t *testing.T) {
 	t.Parallel()
 
@@ -166,4 +204,35 @@ func TestStoreClaim_GlobalLimit(t *testing.T) {
 	if err != ErrClaimRateLimited {
 		t.Fatalf("Claim bob expected ErrClaimRateLimited, got %v", err)
 	}
+}
+
+func openTempStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "relay.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.Init(ctx); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	return s
+}
+
+func testKeyPair() (ssh.Signer, string, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", err
+	}
+	s, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil, "", err
+	}
+	pk, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return nil, "", err
+	}
+	return s, string(ssh.MarshalAuthorizedKey(pk)), nil
 }

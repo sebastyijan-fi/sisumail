@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS identities (
   pubkey      TEXT NOT NULL,
   fingerprint TEXT NOT NULL UNIQUE,
   ipv6_addr   TEXT NOT NULL UNIQUE,
+  allow_tier2 INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL,
   last_seen   TEXT
 );
@@ -93,7 +94,12 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE INDEX IF NOT EXISTS idx_invites_parent ON invites(parent_hash);
 CREATE INDEX IF NOT EXISTS idx_invites_redeemed_by ON invites(redeemed_by);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// Best-effort schema upgrade for older deployments.
+	_, _ = s.db.ExecContext(ctx, `ALTER TABLE identities ADD COLUMN allow_tier2 INTEGER NOT NULL DEFAULT 0;`)
+	return nil
 }
 
 type Identity struct {
@@ -102,6 +108,7 @@ type Identity struct {
 	PubKeyText  string
 	Fingerprint string
 	IPv6        net.IP
+	AllowTier2  bool
 	CreatedAt   time.Time
 	LastSeen    *time.Time
 }
@@ -127,8 +134,8 @@ func (s *Store) Put(ctx context.Context, username string, pubKeyText string, ipv
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, created_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
+VALUES (?, ?, ?, ?, 0, ?)
 ON CONFLICT(username) DO UPDATE SET
   pubkey=excluded.pubkey,
   fingerprint=excluded.fingerprint,
@@ -209,8 +216,8 @@ func (s *Store) Claim(ctx context.Context, username string, pubKey ssh.PublicKey
 	}
 
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, created_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
+VALUES (?, ?, ?, ?, 0, ?)
 `, u, pubKeyText, fp, allocated.String(), nowText)
 	if err != nil {
 		return nil, false, err
@@ -241,13 +248,14 @@ VALUES (?, ?, ?, ?, ?)
 
 func getByUsernameTx(ctx context.Context, tx *sql.Tx, username string) (*Identity, error) {
 	row := tx.QueryRowContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, created_at, last_seen
+SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
 FROM identities WHERE username = ?
 `, username)
 	var (
 		u, pkText, fp, ipStr, created, last sql.NullString
+		allowTier2           sql.NullInt64
 	)
-	if err := row.Scan(&u, &pkText, &fp, &ipStr, &created, &last); err != nil {
+	if err := row.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -278,6 +286,7 @@ FROM identities WHERE username = ?
 		PubKeyText:  pkText.String,
 		Fingerprint: fp.String,
 		IPv6:        ip,
+		AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
 		CreatedAt:   ct,
 		LastSeen:    lt,
 	}, nil
@@ -417,13 +426,14 @@ func (s *Store) GetByUsername(ctx context.Context, username string) (*Identity, 
 		return nil, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, created_at, last_seen
+SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
 FROM identities WHERE username = ?
 `, canon)
 	var (
 		u, pkText, fp, ipStr, created, last sql.NullString
+		allowTier2           sql.NullInt64
 	)
-	if err := row.Scan(&u, &pkText, &fp, &ipStr, &created, &last); err != nil {
+	if err := row.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -454,6 +464,7 @@ FROM identities WHERE username = ?
 		PubKeyText:  pkText.String,
 		Fingerprint: fp.String,
 		IPv6:        ip,
+		AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
 		CreatedAt:   ct,
 		LastSeen:    lt,
 	}, nil
@@ -470,7 +481,7 @@ func (s *Store) DeleteByUsername(ctx context.Context, username string) error {
 
 func (s *Store) All(ctx context.Context) ([]Identity, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, created_at, last_seen
+SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
 FROM identities
 `)
 	if err != nil {
@@ -482,8 +493,9 @@ FROM identities
 	for rows.Next() {
 		var (
 			u, pkText, fp, ipStr, created, last sql.NullString
+			allowTier2           sql.NullInt64
 		)
-		if err := rows.Scan(&u, &pkText, &fp, &ipStr, &created, &last); err != nil {
+		if err := rows.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
 			return nil, err
 		}
 		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pkText.String))
@@ -511,6 +523,7 @@ FROM identities
 			PubKeyText:  pkText.String,
 			Fingerprint: fp.String,
 			IPv6:        ip,
+			AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
 			CreatedAt:   ct,
 			LastSeen:    lt,
 		})
@@ -525,6 +538,19 @@ func (s *Store) TouchLastSeen(ctx context.Context, username string) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, _ = s.db.ExecContext(ctx, `UPDATE identities SET last_seen=? WHERE username=?`, now, u)
+}
+
+func (s *Store) SetAllowTier2(ctx context.Context, username string, allow bool) error {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return err
+	}
+	v := 0
+	if allow {
+		v = 1
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE identities SET allow_tier2=? WHERE username=?`, v, u)
+	return err
 }
 
 // ---- Invite-only claim (v1) -------------------------------------------------
@@ -782,8 +808,8 @@ WHERE code_hash = ? AND (redeemed_by IS NULL OR redeemed_by = '')
 		return nil, nil, err
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, created_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
+VALUES (?, ?, ?, ?, 0, ?)
 `, u, pubKeyText, fp, allocated.String(), nowText)
 	if err != nil {
 		return nil, nil, err
