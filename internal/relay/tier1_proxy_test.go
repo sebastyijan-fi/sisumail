@@ -380,6 +380,119 @@ func TestTier1EnforcesMaxBytesPerConn(t *testing.T) {
 	assertClosedQuickly(t, c, 700*time.Millisecond)
 }
 
+func TestTier1RejectsMailBeforeSTARTTLS(t *testing.T) {
+	reg := NewSessionRegistry()
+
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	ch := &fakeChannel{Conn: serverSide}
+	reqCh := make(chan *ssh.Request)
+	close(reqCh)
+	reg.SetSession("niklas", &Session{
+		Username: "niklas",
+		Conn: &fakeConn{open: func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+			return ch, reqCh, nil
+		}},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	p := &Tier1Proxy{
+		Listener:     ln,
+		DevRouteUser: "niklas",
+		Registry:     reg,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Run(ctx) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Consume delivery preface first to reach proxied payload path.
+	br := bufio.NewReader(clientSide)
+	if _, err := proto.ReadSMTPDeliveryPreface(br); err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+
+	if _, err := c.Write([]byte("MAIL FROM:<a@b>\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Should not forward the MAIL line to the channel.
+	_ = clientSide.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 1)
+	n, err := br.Read(buf)
+	if n != 0 || err == nil {
+		t.Fatalf("expected no forwarded bytes and close, got n=%d err=%v", n, err)
+	}
+
+	assertClosedQuickly(t, c, 700*time.Millisecond)
+}
+
+func TestTier1AllowsSTARTTLSPrelude(t *testing.T) {
+	reg := NewSessionRegistry()
+
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	ch := &fakeChannel{Conn: serverSide}
+	reqCh := make(chan *ssh.Request)
+	close(reqCh)
+	reg.SetSession("niklas", &Session{
+		Username: "niklas",
+		Conn: &fakeConn{open: func(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+			return ch, reqCh, nil
+		}},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	p := &Tier1Proxy{
+		Listener:     ln,
+		DevRouteUser: "niklas",
+		Registry:     reg,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Run(ctx) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	br := bufio.NewReader(clientSide)
+	if _, err := proto.ReadSMTPDeliveryPreface(br); err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+
+	payload := "EHLO example\r\nSTARTTLS\r\n"
+	if _, err := c.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got := make([]byte, len(payload))
+	_ = clientSide.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatalf("read forwarded: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("forwarded mismatch got=%q want=%q", string(got), payload)
+	}
+}
+
 func assertClosedQuickly(t *testing.T, c net.Conn, d time.Duration) {
 	t.Helper()
 

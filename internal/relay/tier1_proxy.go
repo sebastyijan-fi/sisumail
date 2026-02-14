@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -46,6 +47,14 @@ type Tier1Proxy struct {
 	// MaxBytesPerConn bounds total proxied bytes (both directions combined) per connection.
 	MaxBytesPerConn int64
 
+	// SMTP prelude filtering (before STARTTLS).
+	// Tier 1 cannot inspect TLS payloads; these limits exist to fail fast on obvious abuse
+	// and enforce "no MAIL/RCPT/DATA before STARTTLS" to avoid plaintext envelope leakage.
+	PreludeTimeout     time.Duration
+	PreludeMaxBytes    int64
+	PreludeMaxLines    int
+	PreludeMaxLineBytes int
+
 	// Observer receives proxy lifecycle/events for metrics.
 	Observer Tier1Observer
 
@@ -88,6 +97,18 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 	}
 	if p.MaxBytesPerConn <= 0 {
 		p.MaxBytesPerConn = 10 << 20 // 10 MiB
+	}
+	if p.PreludeTimeout <= 0 {
+		p.PreludeTimeout = 8 * time.Second
+	}
+	if p.PreludeMaxBytes <= 0 {
+		p.PreludeMaxBytes = 32 << 10 // 32 KiB
+	}
+	if p.PreludeMaxLines <= 0 {
+		p.PreludeMaxLines = 128
+	}
+	if p.PreludeMaxLineBytes <= 0 {
+		p.PreludeMaxLineBytes = 1200 // slightly above 1000 to allow for CRLF and long params.
 	}
 	if p.activeByUser == nil {
 		p.activeByUser = make(map[string]int)
@@ -262,7 +283,7 @@ func (p *Tier1Proxy) handleConn(inbound net.Conn) {
 	budget := &byteBudget{limit: p.MaxBytesPerConn}
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = copyWithIdleTimeoutAndBudget(ch, inbound, p.IdleTimeout, budget)
+		_, _ = copySenderToChannelWithSMTPPrelude(inbound, ch, p.PreludeTimeout, p.PreludeMaxBytes, p.PreludeMaxLines, p.PreludeMaxLineBytes, p.IdleTimeout, budget, p.Observer)
 		done <- struct{}{}
 	}()
 	go func() {
@@ -277,6 +298,148 @@ func (p *Tier1Proxy) fastFail(inbound net.Conn) {
 	if tc, ok := inbound.(*net.TCPConn); ok {
 		_ = tc.SetLinger(0)
 	}
+}
+
+var errSMTPPreludeRejected = errors.New("smtp prelude rejected")
+
+func copySenderToChannelWithSMTPPrelude(sender net.Conn, ch io.Writer, preludeTimeout time.Duration, preludeMaxBytes int64, preludeMaxLines int, preludeMaxLineBytes int, idleTimeout time.Duration, budget *byteBudget, obs Tier1Observer) (int64, error) {
+	br := bufio.NewReader(sender)
+	var (
+		total       int64
+		preBytes    int64
+		lines       int
+		sawStartTLS bool
+		switchToRaw bool
+		rawSrc      io.Reader = sender
+		start       = time.Now()
+	)
+
+	write := func(b []byte) error {
+		if idleTimeout > 0 {
+			if wd, ok := ch.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				_ = wd.SetWriteDeadline(time.Now().Add(idleTimeout))
+			}
+		}
+		n, err := ch.Write(b)
+		total += int64(n)
+		if err != nil {
+			return err
+		}
+		if n != len(b) {
+			return io.ErrShortWrite
+		}
+		if !budget.add(int64(n)) {
+			return errConnByteBudgetExceeded
+		}
+		return nil
+	}
+
+	// Parse line-oriented SMTP commands until STARTTLS is requested. After that,
+	// the stream becomes binary (TLS handshake), so we switch to raw copy.
+	for !sawStartTLS && !switchToRaw {
+		if preludeTimeout > 0 && time.Since(start) > preludeTimeout {
+			if obs != nil {
+				obs.OnRejected("prelude_timeout")
+			}
+			_ = sender.Close()
+			return total, errSMTPPreludeRejected
+		}
+		if preludeMaxBytes > 0 && preBytes >= preludeMaxBytes {
+			if obs != nil {
+				obs.OnRejected("prelude_bytes")
+			}
+			_ = sender.Close()
+			return total, errSMTPPreludeRejected
+		}
+		if preludeMaxLines > 0 && lines >= preludeMaxLines {
+			if obs != nil {
+				obs.OnRejected("prelude_lines")
+			}
+			_ = sender.Close()
+			return total, errSMTPPreludeRejected
+		}
+		if idleTimeout > 0 {
+			dl := time.Now().Add(idleTimeout)
+			if preludeTimeout > 0 {
+				remain := preludeTimeout - time.Since(start)
+				if remain < 0 {
+					remain = 0
+				}
+				rdl := time.Now().Add(remain)
+				if rdl.Before(dl) {
+					dl = rdl
+				}
+			}
+			_ = sender.SetReadDeadline(dl)
+		}
+		line, err := br.ReadSlice('\n')
+		if len(line) > 0 {
+			preBytes += int64(len(line))
+			lines++
+			// If the line is too long or not line-oriented at all, stop parsing and go raw.
+			// This keeps Tier 1 robust if a client connects with a non-SMTP protocol (tests/dev)
+			// or if a sender starts TLS without issuing STARTTLS (misbehaving, but we go blind).
+			if preludeMaxLineBytes > 0 && len(line) > preludeMaxLineBytes {
+				switchToRaw = true
+			}
+
+			// Normalize for parsing only (do not alter forwarded bytes).
+			if !switchToRaw {
+				s := strings.TrimSpace(strings.TrimRight(string(line), "\r\n"))
+				up := strings.ToUpper(s)
+				if strings.HasPrefix(up, "MAIL FROM:") || strings.HasPrefix(up, "RCPT TO:") || up == "DATA" || strings.HasPrefix(up, "BDAT ") {
+					if obs != nil {
+						obs.OnRejected("mail_before_starttls")
+					}
+					_ = sender.Close()
+					return total, errSMTPPreludeRejected
+				}
+				if up == "STARTTLS" {
+					sawStartTLS = true
+				}
+			}
+			if err := write(line); err != nil {
+				return total, err
+			}
+		}
+		if err != nil {
+			if errors.Is(err, bufio.ErrBufferFull) {
+				// No newline in buffer yet; treat as raw and keep piping.
+				switchToRaw = true
+				rawSrc = br
+				break
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// Sender isn't speaking line-oriented SMTP prelude quickly; go raw.
+				switchToRaw = true
+				rawSrc = br
+				break
+			}
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+
+	// After STARTTLS request (or when giving up parsing), switch to raw copy.
+	if switchToRaw {
+		rawSrc = br
+	} else if sawStartTLS {
+		if n := br.Buffered(); n > 0 {
+			buf, _ := br.Peek(n)
+			if len(buf) > 0 {
+				if err := write(buf); err != nil {
+					return total, err
+				}
+			}
+			_, _ = br.Discard(n)
+		}
+		rawSrc = sender
+	}
+
+	n, err := copyWithIdleTimeoutAndBudget(ch, rawSrc, idleTimeout, budget)
+	return total + n, err
 }
 
 func (p *Tier1Proxy) tryAcquireUser(user string) bool {
