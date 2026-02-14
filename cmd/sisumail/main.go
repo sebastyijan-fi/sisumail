@@ -131,6 +131,62 @@ func runClientDoctor(keyPath, knownHostsPath, configPath string) int {
 	return fail
 }
 
+func runClientDoctorFull(keyPath, knownHostsPath, configPath, relayAddr string, insecureHostKey bool, full bool) int {
+	fail := 0
+	check := func(ok bool, name string, detail string) {
+		if ok {
+			fmt.Printf("PASS %s\n", name)
+			return
+		}
+		fail = 1
+		if strings.TrimSpace(detail) == "" {
+			detail = "check failed"
+		}
+		fmt.Printf("FAIL %s: %s\n", name, detail)
+	}
+
+	// Reuse the existing local checks first (prints PASS/FAIL already).
+	if code := runClientDoctor(keyPath, knownHostsPath, configPath); code != 0 {
+		fail = 1
+	}
+
+	if !full {
+		return fail
+	}
+
+	// Relay reachability check (TCP dial).
+	if strings.TrimSpace(relayAddr) == "" {
+		check(false, "relay:addr", "missing -relay")
+		return fail
+	}
+	d := net.Dialer{Timeout: 4 * time.Second}
+	c, err := d.Dial("tcp", relayAddr)
+	if err != nil {
+		check(false, "relay:tcp", err.Error())
+	} else {
+		_ = c.Close()
+		check(true, "relay:tcp", "")
+	}
+
+	// Host key pinning stance.
+	if insecureHostKey {
+		check(false, "relay:hostkey", "-insecure-host-key is enabled (disable for production)")
+	} else {
+		// Try to construct known_hosts callback; this fails if file is missing/corrupt.
+		_, err := buildHostKeyCallback(false, knownHostsPath)
+		check(err == nil, "relay:hostkey", "known_hosts callback failed: "+errString(err))
+	}
+
+	return fail
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func main() {
 	home := os.Getenv("HOME")
 	argProfile, argProfileSet := detectProfileFromArgs(os.Args[1:])
@@ -186,6 +242,7 @@ func main() {
 		claimUsername       = flag.String("claim", "", "invite-only: claim a new sisumail username (uses your -key) and exit")
 		claimInviteCode     = flag.String("claim-invite", "", "invite-only: invite code for -claim")
 		doctor              = flag.Bool("doctor", false, "print local readiness checks and exit")
+		doctorFull          = flag.Bool("doctor-full", false, "run extended checks (relay reachability, host key pinning) and exit")
 	)
 	flag.Parse()
 	*profile = normalizeProfileName(*profile)
@@ -270,8 +327,8 @@ func main() {
 		return
 	}
 
-	if *doctor {
-		code := runClientDoctor(strings.TrimSpace(*keyPath), strings.TrimSpace(*knownHostsPath), strings.TrimSpace(*configPath))
+	if *doctor || *doctorFull {
+		code := runClientDoctorFull(strings.TrimSpace(*keyPath), strings.TrimSpace(*knownHostsPath), strings.TrimSpace(*configPath), strings.TrimSpace(*relayAddr), *insecureHostKey, *doctorFull)
 		if code != 0 {
 			os.Exit(code)
 		}
