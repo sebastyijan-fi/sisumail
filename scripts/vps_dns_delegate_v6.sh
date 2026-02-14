@@ -25,7 +25,7 @@ echo "[dns] expects on VPS:"
 echo "  - /etc/sisumail.env has: HCLOUD_TOKEN, SISUMAIL_DNS_ZONE"
 
 cat <<'PY' | "${ssh_cmd[@]}" "python3 -"
-import json, sys, urllib.request, urllib.parse, subprocess
+import json, sys, urllib.request, urllib.parse, urllib.error, subprocess
 
 def sh(cmd):
   return subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -63,11 +63,15 @@ def req(method, path, body=None):
   r = urllib.request.Request(url, data=data, method=method)
   r.add_header("Authorization", "Bearer " + token)
   r.add_header("Content-Type", "application/json")
-  with urllib.request.urlopen(r, timeout=30) as resp:
-    b = resp.read()
-    if not b:
-      return None
-    return json.loads(b.decode("utf-8"))
+  try:
+    with urllib.request.urlopen(r, timeout=30) as resp:
+      b = resp.read()
+      if not b:
+        return None
+      return json.loads(b.decode("utf-8"))
+  except urllib.error.HTTPError as e:
+    msg = e.read().decode("utf-8", "replace")
+    raise RuntimeError(f"http {e.code} {url}: {msg[:300]}")
 
 def zone_id_by_name(name):
   q = urllib.parse.urlencode({"name": name})
@@ -93,7 +97,7 @@ def get_rrset(zid, name, typ):
   typ = typ.strip().upper()
   try:
     return (req("GET", f"/zones/{zid}/rrsets/{urllib.parse.quote(name)}/{typ}") or {}).get("rrset")
-  except Exception as e:
+  except RuntimeError as e:
     if "http 404" in str(e):
       return None
     raise
