@@ -32,7 +32,7 @@ Minimum:
 
 - `SISUMAIL_DNS_ZONE=<zone>`
 - `SISUMAIL_IPV6_PREFIX=<your /64>`
-- `SISUMAIL_INVITE_PEPPER=<random secret>`
+- `SISUMAIL_INVITE_PEPPER=<random secret>` (generate: `scripts/gen_invite_pepper.sh`)
 
 Recommended production policy:
 
@@ -110,4 +110,3 @@ sisumail-relay -mint-invites -mint-invites-n 20
 ```
 
 Users claim via the client/app using `claim-v1` (no open first-claim).
-

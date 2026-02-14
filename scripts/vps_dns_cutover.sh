@@ -43,8 +43,8 @@ ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
 
 echo "[dns] target=${target}"
 
-remote_py='
-import json, os, re, subprocess, sys, urllib.request, urllib.parse
+cat <<'PY' | "${ssh_cmd[@]}" "python3 -"
+import json, subprocess, sys, urllib.request, urllib.parse
 
 def sh(cmd):
   return subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -96,7 +96,6 @@ def req(method, path, body=None):
         return None
       return json.loads(b.decode("utf-8"))
   except urllib.error.HTTPError as e:
-    # propagate structured errors for better operator output
     msg = e.read().decode("utf-8", "replace")
     raise RuntimeError(f"http {e.code} {url}: {msg[:300]}")
 
@@ -160,11 +159,9 @@ def remove_rrset(zid, name, typ):
 
 zid = zone_id_by_name(zone)
 
-# Root web/discovery should be v4+v6.
 upsert_rrset(zid, zone, "A", 60, [ipv4])
 upsert_rrset(zid, zone, "AAAA", 60, [ipv6])
 
-# Spool is v4 only in the Tier1+Tier2 same-host design.
 upsert_rrset(zid, "spool."+zone, "A", 60, [ipv4])
 remove_rrset(zid, "spool."+zone, "AAAA")
 
@@ -174,9 +171,6 @@ print("root A", ipv4)
 print("root AAAA", ipv6)
 print("spool A", ipv4)
 print("spool AAAA", "removed")
-'
-
-"${ssh_cmd[@]}" "python3 - <<'PY'\n${remote_py}\nPY"
+PY
 
 echo "[dns] done"
-

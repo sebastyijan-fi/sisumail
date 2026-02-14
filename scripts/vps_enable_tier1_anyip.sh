@@ -43,7 +43,7 @@ if [[ -z "${host}" ]]; then
 fi
 
 target="${user}@${host}"
-ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=10 "${target}")
+ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${target}")
 
 remote() {
   "${ssh_cmd[@]}" "$1"
