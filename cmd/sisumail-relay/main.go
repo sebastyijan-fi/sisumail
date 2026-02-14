@@ -347,13 +347,25 @@ func runRelayDoctor(dbPath string, full bool) int {
 		fmt.Printf("FAIL %s: %s\n", name, detail)
 	}
 
-	// Env checks (production-relevant).
-	zone := strings.TrimSpace(os.Getenv("SISUMAIL_DNS_ZONE"))
-	prefix := strings.TrimSpace(os.Getenv("SISUMAIL_IPV6_PREFIX"))
-	pepper := strings.TrimSpace(os.Getenv("SISUMAIL_INVITE_PEPPER"))
-	hcloud := strings.TrimSpace(os.Getenv("HCLOUD_TOKEN"))
+	// Env checks (production-relevant). If called manually, load /etc/sisumail.env too.
+	envFile := "/etc/sisumail.env"
+	env := map[string]string{}
+	if b, err := os.ReadFile(envFile); err == nil {
+		env = parseEnvFile(string(b))
+	}
+	get := func(k string) string {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+		return strings.TrimSpace(env[k])
+	}
+
+	zone := get("SISUMAIL_DNS_ZONE")
+	prefix := get("SISUMAIL_IPV6_PREFIX")
+	pepper := get("SISUMAIL_INVITE_PEPPER")
+	hcloud := get("HCLOUD_TOKEN")
 	if hcloud == "" {
-		hcloud = strings.TrimSpace(os.Getenv("HETZNER_CLOUD_TOKEN"))
+		hcloud = get("HETZNER_CLOUD_TOKEN")
 	}
 
 	check(zone != "", "env:SISUMAIL_DNS_ZONE", "set SISUMAIL_DNS_ZONE (e.g. sisumail.fi)")
@@ -394,9 +406,8 @@ func runRelayDoctor(dbPath string, full bool) int {
 	if full {
 		// AnyIP route sanity.
 		if prefix != "" {
-			// We only check that the command succeeds and output contains "local".
-			out, err := sh("ip", "-6", "route", "show", "local", prefix)
-			check(err == nil && strings.Contains(out, "local"), "net:anyip-route", strings.TrimSpace(out))
+			out, err := sh("ip", "-6", "route", "show", "table", "local")
+			check(err == nil && strings.Contains(out, prefix), "net:anyip-route", "expected local route for "+prefix)
 		} else {
 			check(false, "net:anyip-route", "missing SISUMAIL_IPV6_PREFIX")
 		}
@@ -434,6 +445,27 @@ func sh(cmd string, args ...string) (string, error) {
 func systemdActive(unit string) bool {
 	out, err := sh("systemctl", "is-active", unit)
 	return err == nil && strings.TrimSpace(out) == "active"
+}
+
+func parseEnvFile(s string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {
