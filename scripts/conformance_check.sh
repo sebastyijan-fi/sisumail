@@ -221,7 +221,7 @@ run_relay_node_checks() {
   local p="relay-node"
   check_rg "$p" "RN-9.1" "MUST" "Tier 1 blind relay proxy exists." "type Tier1Proxy struct" "internal/relay/tier1_proxy.go"
   check_rg "$p" "RN-9.2" "MUST" "Tier 2 SMTP ingress bridge exists." "smtp\\.NewServer" "cmd/sisumail-tier2/main.go"
-  check_rg "$p" "RN-9.3" "MUST" "Split MX routing template is documented." "10 v6\\.<u>\\.sisumail\\.fi\\." "docs/dns-records.md"
+  check_rg "$p" "RN-9.3" "MUST" "Split MX routing template is documented." "10 <u>\\.v6\\.sisumail\\.fi\\." "docs/dns-records.md"
   check_rg "$p" "RN-9.4" "MUST" "Tier 2 STARTTLS policy modes are implemented." "parseTLSMode" "cmd/sisumail-tier2/main.go"
   check_na "$p" "RN-9.5" "MUST" "Null MX behavior" "Receive-only ingress implementation does not perform outbound MX resolution in v1."
   check_rg "$p" "RN-10.1" "MUST" "AnyIP deployment controls are documented." "ip_nonlocal_bind" "docs/operator-quickstart.md"

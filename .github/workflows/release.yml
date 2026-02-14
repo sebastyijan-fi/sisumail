@@ -57,10 +57,11 @@ jobs:
 
           go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail-relay" ./cmd/sisumail-relay
           go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail-tier2" ./cmd/sisumail-tier2
+          go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail-dns" ./cmd/sisumail-dns
           go build -trimpath -ldflags "-s -w" -o "${OUTDIR}/sisumail" ./cmd/sisumail
 
           # Package as tar.gz (zip on Windows is not needed yet).
-          tar -C "${OUTDIR}" -czf "dist/sisumail_${VERSION}_${GOOS}_${GOARCH}.tar.gz" sisumail-relay sisumail-tier2 sisumail
+          tar -C "${OUTDIR}" -czf "dist/sisumail_${VERSION}_${GOOS}_${GOARCH}.tar.gz" sisumail-relay sisumail-tier2 sisumail-dns sisumail
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

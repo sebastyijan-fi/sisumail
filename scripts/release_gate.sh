@@ -67,7 +67,7 @@ need_cmd go
 echo "[release-gate] P0 receive-only guardrails"
 assert_rg "Sisumail is sovereign mail \\*\\*receive\\*\\* infrastructure\\." README.md "README declares receive-only framing"
 assert_rg "Sisumail is \\*\\*not\\*\\* an outbound email sending platform\\." README.md "README blocks outbound-email framing"
-assert_rg "10 v6\\.<u>\\.sisumail\\.fi\\." docs/dns-records.md "DNS template includes Tier1 MX target"
+assert_rg "10 <u>\\.v6\\.sisumail\\.fi\\." docs/dns-records.md "DNS template includes Tier1 MX target"
 assert_rg "20 spool\\.sisumail\\.fi\\." docs/dns-records.md "DNS template includes Tier2 MX target"
 assert_rg "v=spf1 -all" docs/dns-records.md "DNS template enforces SPF -all"
 assert_rg "Sisumail is sovereign receive-only mail infrastructure\\." cmd/sisumail-relay/main.go "hosted shell repeats receive-only framing"

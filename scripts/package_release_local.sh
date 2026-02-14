@@ -22,9 +22,11 @@ build_one() {
   GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
     go build -trimpath -ldflags "-s -w" -o "${outdir}/sisumail-tier2" ./cmd/sisumail-tier2
   GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+    go build -trimpath -ldflags "-s -w" -o "${outdir}/sisumail-dns" ./cmd/sisumail-dns
+  GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
     go build -trimpath -ldflags "-s -w" -o "${outdir}/sisumail" ./cmd/sisumail
 
-  tar -C "${outdir}" -czf "dist/sisumail_${VERSION}_${goos}_${goarch}.tar.gz" sisumail-relay sisumail-tier2 sisumail
+  tar -C "${outdir}" -czf "dist/sisumail_${VERSION}_${goos}_${goarch}.tar.gz" sisumail-relay sisumail-tier2 sisumail-dns sisumail
 }
 
 rm -rf "dist/${VERSION}"
@@ -38,10 +40,10 @@ build_one darwin arm64
 echo "[package] checksums"
 (
   cd dist
-  sha256sum "sisumail_${VERSION}_"*.tar.gz > "sha256sum_${VERSION}.txt"
+  sha256sum "sisumail_${VERSION}_"*.tar.gz > "sha256sum.txt"
 )
 
 echo "[package] done"
 echo "Artifacts:"
 ls -1 "dist/sisumail_${VERSION}_"*.tar.gz
-echo "Checksum file: dist/sha256sum_${VERSION}.txt"
+echo "Checksum file: dist/sha256sum.txt"
