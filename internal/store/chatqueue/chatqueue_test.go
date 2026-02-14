@@ -52,4 +52,3 @@ func TestPutListGetAck(t *testing.T) {
 		t.Fatalf("expected empty queue after ack")
 	}
 }
-

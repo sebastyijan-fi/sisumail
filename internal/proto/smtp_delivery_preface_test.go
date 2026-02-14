@@ -37,4 +37,3 @@ func TestSMTPDeliveryPrefaceRoundTrip(t *testing.T) {
 		t.Fatalf("received at: got %d want %d", got.ReceivedAt.UnixMilli(), meta.ReceivedAt.UnixMilli())
 	}
 }
-

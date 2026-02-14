@@ -49,4 +49,3 @@ func SelfSigned(dnsNames []string, validFor time.Duration) (tls.Certificate, err
 
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
-

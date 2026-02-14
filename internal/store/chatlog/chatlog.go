@@ -100,4 +100,3 @@ func sanitizePeer(peer string) string {
 	peer = strings.ReplaceAll(peer, "..", "_")
 	return peer
 }
-

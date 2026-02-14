@@ -32,4 +32,3 @@ func TestCheckAndUpdate(t *testing.T) {
 		t.Fatalf("changed status=%q prev=%q", status, prev)
 	}
 }
-

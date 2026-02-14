@@ -84,4 +84,3 @@ func (s *Store) writeAllUnlocked(m map[string]Entry) error {
 	}
 	return os.Rename(tmp, s.Path)
 }
-

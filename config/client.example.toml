@@ -5,7 +5,7 @@ username = "niklas"
 ssh_key_path = "~/.ssh/id_ed25519"
 
 [relay]
-addr = "sisumail.fi:22"
+addr = "sisumail.fi:2222"
 
 [smtp]
 # Local SMTP daemon bind (only reachable through SSH channels from the relay).

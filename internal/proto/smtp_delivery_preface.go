@@ -95,4 +95,3 @@ func PrefaceReader(r io.Reader, meta SMTPDeliveryMeta) io.Reader {
 	}()
 	return pr
 }
-

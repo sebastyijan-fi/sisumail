@@ -11,7 +11,8 @@ import (
 // SpoolDeliveryHeader is the out-of-band header for a Tier 2 spool delivery.
 //
 // Wire format (single line, ASCII):
-//   SPOOL <msg_id> <size_bytes>\n
+//
+//	SPOOL <msg_id> <size_bytes>\n
 //
 // Followed by exactly <size_bytes> of age ciphertext (not framed further).
 type SpoolDeliveryHeader struct {
@@ -77,4 +78,3 @@ func ReadSpoolAck(r io.Reader, wantMsgID string) error {
 	}
 	return nil
 }
-

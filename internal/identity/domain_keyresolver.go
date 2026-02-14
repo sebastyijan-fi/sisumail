@@ -25,7 +25,9 @@ func (r *DomainKeyResolver) Resolve(domain string) (string, error) {
 		return "", fmt.Errorf("missing zone")
 	}
 
-	suffix := "." + r.Zone
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	zone := strings.ToLower(strings.TrimSpace(r.Zone))
+	suffix := "." + zone
 	if !strings.HasSuffix(domain, suffix) {
 		return "", fmt.Errorf("domain not in zone")
 	}
@@ -50,4 +52,3 @@ func (r *DomainKeyResolver) Resolve(domain string) (string, error) {
 	}
 	return rec.PubKeyText, nil
 }
-

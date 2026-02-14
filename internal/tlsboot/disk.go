@@ -50,4 +50,3 @@ func (p *DiskProvider) GetCertificate(now time.Time) (CertResult, error) {
 		Source:          "disk",
 	}, nil
 }
-

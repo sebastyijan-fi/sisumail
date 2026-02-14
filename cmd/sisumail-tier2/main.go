@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -79,6 +80,21 @@ func main() {
 	}
 
 	srv := smtp.NewServer(backend)
+	// Force the network family when the operator provides an explicit IP.
+	// This matters for the Tier 1 + Tier 2 same-host setup:
+	// - Tier 1 uses IPv6 AnyIP on :25
+	// - Tier 2 often binds IPv4 only on 0.0.0.0:25
+	// If we listen on an IPv4 address but net.Listen selects a dual-stack socket,
+	// Tier 1 cannot bind IPv6 :25.
+	if host, _, err := net.SplitHostPort(*listen); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.To4() != nil {
+				srv.Network = "tcp4"
+			} else {
+				srv.Network = "tcp6"
+			}
+		}
+	}
 	srv.Addr = *listen
 	srv.Domain = fmt.Sprintf("spool.%s", *zone)
 	srv.AllowInsecureAuth = false

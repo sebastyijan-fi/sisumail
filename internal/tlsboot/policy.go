@@ -17,4 +17,3 @@ func ParsePolicy(s string) BootstrapPolicy {
 		return PolicyPragmatic
 	}
 }
-

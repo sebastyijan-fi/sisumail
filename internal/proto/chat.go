@@ -10,7 +10,7 @@ import (
 )
 
 type ChatSendHeader struct {
-	To       string
+	To        string
 	SizeBytes int64
 }
 

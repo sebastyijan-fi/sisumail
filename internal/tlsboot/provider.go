@@ -72,4 +72,3 @@ func (p *StrictProvider) GetCertificate(now time.Time) (CertResult, error) {
 	}
 	return res, nil
 }
-

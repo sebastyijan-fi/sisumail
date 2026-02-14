@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,7 +99,14 @@ func (p *Tier1Proxy) Run(ctx context.Context) error {
 	ln := p.Listener
 	var err error
 	if ln == nil {
-		ln, err = net.Listen("tcp", p.ListenAddr)
+		// Production uses IPv6 AnyIP for Tier 1 and often runs Tier 2 on IPv4 :25.
+		// If we listen on "[::]:25" with the default dual-stack behavior, it can
+		// unintentionally grab IPv4 too and conflict with the Tier 2 listener.
+		network := "tcp"
+		if strings.HasPrefix(strings.TrimSpace(p.ListenAddr), "[") {
+			network = "tcp6"
+		}
+		ln, err = net.Listen(network, p.ListenAddr)
 		if err != nil {
 			return err
 		}
