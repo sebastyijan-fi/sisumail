@@ -206,6 +206,7 @@ You should see the SMTP banner from the client's local SMTP daemon, because the 
 ## DNS (Split MX)
 
 See `docs/dns-records.md` for the exact per-user record templates.
+For a linear production deployment, see `docs/production-runbook.md`.
 
 For relay health/readiness/metrics and initial alert guidance, see `docs/alerts-runbook.md`.
 For real relay-mediated ACME verification on an operator host, use `scripts/smoke_acme_relay_live.sh`.

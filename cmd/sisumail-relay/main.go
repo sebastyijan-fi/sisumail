@@ -77,6 +77,7 @@ func main() {
 		wellKnownListen        = flag.String("well-known-listen", "", "public discovery HTTP listen address (disabled when empty), e.g. :8080")
 		wellKnownPath          = flag.String("well-known-path", "/.well-known/sisu-node", "HTTP path for discovery document")
 		wellKnownFile          = flag.String("well-known-file", "", "path to JSON document served at -well-known-path (required when -well-known-listen is set)")
+		doctor               = flag.Bool("doctor", false, "print production readiness checks and exit")
 	)
 	flag.Parse()
 
@@ -94,6 +95,14 @@ func main() {
 
 	if *initDB {
 		log.Printf("db initialized: %s", *dbPath)
+		return
+	}
+
+	if *doctor {
+		code := runRelayDoctor(*dbPath)
+		if code != 0 {
+			os.Exit(code)
+		}
 		return
 	}
 
@@ -299,6 +308,68 @@ func main() {
 	}
 
 	<-ctx.Done()
+}
+
+func runRelayDoctor(dbPath string) int {
+	// Keep output intentionally plain: this is for humans and logs.
+	fail := 0
+	check := func(ok bool, name string, detail string) {
+		if ok {
+			fmt.Printf("PASS %s\n", name)
+			return
+		}
+		fail = 1
+		if strings.TrimSpace(detail) == "" {
+			detail = "check failed"
+		}
+		fmt.Printf("FAIL %s: %s\n", name, detail)
+	}
+
+	// Env checks (production-relevant).
+	zone := strings.TrimSpace(os.Getenv("SISUMAIL_DNS_ZONE"))
+	prefix := strings.TrimSpace(os.Getenv("SISUMAIL_IPV6_PREFIX"))
+	pepper := strings.TrimSpace(os.Getenv("SISUMAIL_INVITE_PEPPER"))
+	hcloud := strings.TrimSpace(os.Getenv("HCLOUD_TOKEN"))
+	if hcloud == "" {
+		hcloud = strings.TrimSpace(os.Getenv("HETZNER_CLOUD_TOKEN"))
+	}
+
+	check(zone != "", "env:SISUMAIL_DNS_ZONE", "set SISUMAIL_DNS_ZONE (e.g. sisumail.fi)")
+	check(prefix != "", "env:SISUMAIL_IPV6_PREFIX", "set SISUMAIL_IPV6_PREFIX (routed /64 for AnyIP Tier1)")
+	if zone != "" {
+		z := strings.TrimSuffix(zone, ".")
+		check(z != "" && strings.Contains(z, "."), "env:SISUMAIL_DNS_ZONE.format", "zone should be a domain name")
+	}
+	if prefix != "" {
+		_, ipnet, err := net.ParseCIDR(prefix)
+		ok := err == nil && ipnet != nil
+		detail := ""
+		if err != nil {
+			detail = err.Error()
+		}
+		check(ok, "env:SISUMAIL_IPV6_PREFIX.parse", detail)
+	}
+	check(pepper != "", "env:SISUMAIL_INVITE_PEPPER", "set SISUMAIL_INVITE_PEPPER to prevent offline invite guessing")
+	check(hcloud != "", "env:HCLOUD_TOKEN", "set HCLOUD_TOKEN so provisioning + acme-dns01 can work")
+
+	// DB checks.
+	st, err := identity.Open(dbPath)
+	if err != nil {
+		check(false, "db:open", err.Error())
+		return fail
+	}
+	defer st.Close()
+	if err := st.Init(context.Background()); err != nil {
+		check(false, "db:init", err.Error())
+		return fail
+	}
+	check(true, "db:open", "")
+	check(true, "db:schema", "")
+
+	// Policy checks.
+	check(strings.TrimSpace(os.Getenv("SISUMAIL_ALLOW_CLAIM")) != "true", "policy:allow-claim", "production should keep SISUMAIL_ALLOW_CLAIM=false (invite-only)")
+
+	return fail
 }
 
 func loadProvisioningFromEnv() (*provision.Provisioner, *net.IPNet) {

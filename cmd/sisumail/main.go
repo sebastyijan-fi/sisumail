@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -46,6 +47,89 @@ import (
 )
 
 const localSMTPMaxMessageBytes = 5 << 20 // 5 MiB cap to bound MIME/attachment abuse.
+
+func runClientDoctor(keyPath, knownHostsPath, configPath string) int {
+	fail := 0
+	check := func(ok bool, name string, detail string) {
+		if ok {
+			fmt.Printf("PASS %s\n", name)
+			return
+		}
+		fail = 1
+		if strings.TrimSpace(detail) == "" {
+			detail = "check failed"
+		}
+		fmt.Printf("FAIL %s: %s\n", name, detail)
+	}
+
+	// Key file.
+	if strings.TrimSpace(keyPath) == "" {
+		check(false, "key:path", "missing -key (or config override)")
+	} else {
+		b, err := os.ReadFile(keyPath)
+		if err != nil {
+			check(false, "key:read", err.Error())
+		} else if _, err := ssh.ParsePrivateKey(b); err != nil {
+			check(false, "key:parse", err.Error())
+		} else {
+			check(true, "key:parse", "")
+		}
+	}
+
+	// known_hosts file.
+	if strings.TrimSpace(knownHostsPath) == "" {
+		check(false, "known_hosts:path", "missing -known-hosts (or config override)")
+	} else if _, err := os.Stat(knownHostsPath); err != nil {
+		check(false, "known_hosts:stat", err.Error())
+	} else {
+		check(true, "known_hosts:stat", "")
+	}
+
+	// Config file path (we don't require it to exist because users can run flag-only,
+	// but it helps detect surprising locations/permissions).
+	if strings.TrimSpace(configPath) == "" {
+		check(false, "config:path", "missing -config")
+	} else if _, err := os.Stat(configPath); err != nil {
+		check(false, "config:stat", err.Error())
+	} else {
+		check(true, "config:stat", "")
+	}
+
+	// TLS store sanity: catch corrupted cert files that cause confusing bootstrap loops.
+	home := os.Getenv("HOME")
+	if home != "" {
+		dir := filepath.Join(home, ".local", "share", "sisumail", "tls")
+		if entries, err := os.ReadDir(dir); err == nil {
+			var anyBad bool
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				if !strings.HasSuffix(name, ".crt.pem") {
+					continue
+				}
+				p := filepath.Join(dir, name)
+				b, err := os.ReadFile(p)
+				if err != nil {
+					anyBad = true
+					continue
+				}
+				blk, _ := pem.Decode(b)
+				if blk == nil || blk.Type != "CERTIFICATE" {
+					anyBad = true
+					continue
+				}
+				if _, err := x509.ParseCertificate(blk.Bytes); err != nil {
+					anyBad = true
+				}
+			}
+			check(!anyBad, "tls:cert-parse", "one or more certs in ~/.local/share/sisumail/tls failed to parse")
+		}
+	}
+
+	return fail
+}
 
 func main() {
 	home := os.Getenv("HOME")
@@ -101,6 +185,7 @@ func main() {
 		activeProfilePath   = flag.String("active-profile-path", def.ActiveProfilePath, "path for remembered active profile")
 		claimUsername       = flag.String("claim", "", "invite-only: claim a new sisumail username (uses your -key) and exit")
 		claimInviteCode     = flag.String("claim-invite", "", "invite-only: invite code for -claim")
+		doctor              = flag.Bool("doctor", false, "print local readiness checks and exit")
 	)
 	flag.Parse()
 	*profile = normalizeProfileName(*profile)
@@ -182,6 +267,14 @@ func main() {
 		}
 		log.Printf("initialized local paths: maildir=%s chat=%s", strings.TrimSpace(*maildirRoot), effectiveChatDir(strings.TrimSpace(*chatDir), strings.TrimSpace(*user)))
 		log.Printf("next step: run `sisumail`")
+		return
+	}
+
+	if *doctor {
+		code := runClientDoctor(strings.TrimSpace(*keyPath), strings.TrimSpace(*knownHostsPath), strings.TrimSpace(*configPath))
+		if code != 0 {
+			os.Exit(code)
+		}
 		return
 	}
 	if err := writeActiveProfile(strings.TrimSpace(*activeProfilePath), strings.TrimSpace(*profile)); err != nil {
