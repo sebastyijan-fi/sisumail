@@ -48,3 +48,28 @@ sqlite3 /path/to/sisumail-relay.db ".backup '/backups/sisumail-relay-$(date +%F-
 3. Check recent logs for `request_id=` and `audit action=`.
 4. Check `/metrics` trend for error/reject counters.
 5. If data integrity concern exists, stop writes and restore from latest valid backup.
+
+## Continuous Dogfood Smoke
+
+Install:
+
+```bash
+install -m 0755 scripts/smoke_production.sh /usr/local/bin/sisumail-smoke-production
+install -m 0644 deploy/systemd/sisumail-smoke.service /etc/systemd/system/sisumail-smoke.service
+install -m 0644 deploy/systemd/sisumail-smoke.timer /etc/systemd/system/sisumail-smoke.timer
+systemctl daemon-reload
+systemctl enable --now sisumail-smoke.timer
+```
+
+Run immediately:
+
+```bash
+systemctl start sisumail-smoke.service
+systemctl status sisumail-smoke.service --no-pager
+```
+
+Inspect last run logs:
+
+```bash
+journalctl -u sisumail-smoke.service -n 50 --no-pager
+```

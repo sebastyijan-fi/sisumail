@@ -1,0 +1,20 @@
+[Unit]
+Description=Sisumail Production Smoke Check
+After=network-online.target sisumail-relay.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sisumail-relay.env
+WorkingDirectory=/opt/sisumail
+ExecStart=/usr/local/bin/sisumail-smoke-production
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/sisumail-smoke
+
+[Install]
+WantedBy=multi-user.target
