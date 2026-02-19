@@ -113,29 +113,7 @@ func main() {
 	} else {
 		log.Printf("site dir %q not found; landing routes disabled", *siteDir)
 	}
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if err := store.Ping(r.Context()); err != nil {
-			writeErr(w, http.StatusServiceUnavailable, "not_ready", "database unavailable")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "sisumail_http_requests_total %d\n", metrics.httpRequestsTotal.Load())
-		fmt.Fprintf(w, "sisumail_http_errors_total %d\n", metrics.httpErrorsTotal.Load())
-		fmt.Fprintf(w, "sisumail_http_auth_failures_total %d\n", metrics.httpAuthFailuresTotal.Load())
-		fmt.Fprintf(w, "sisumail_claims_total %d\n", metrics.claimsTotal.Load())
-		fmt.Fprintf(w, "sisumail_claim_failures_total %d\n", metrics.claimFailuresTotal.Load())
-		fmt.Fprintf(w, "sisumail_smtp_connections_current %d\n", metrics.smtpConnectionsCurrent.Load())
-		fmt.Fprintf(w, "sisumail_smtp_connections_total %d\n", metrics.smtpConnectionsTotal.Load())
-		fmt.Fprintf(w, "sisumail_smtp_accepted_total %d\n", metrics.smtpAcceptedTotal.Load())
-		fmt.Fprintf(w, "sisumail_smtp_rejected_total %d\n", metrics.smtpRejectedTotal.Load())
-		fmt.Fprintf(w, "sisumail_purge_removed_total %d\n", metrics.purgeRemovedTotal.Load())
-	})
+	registerOperationalRoutes(mux, store, metrics)
 
 	mux.HandleFunc("/v1/claim", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -761,6 +739,36 @@ func parseInt64(s string) (int64, error) {
 		out = out*10 + int64(r-'0')
 	}
 	return out, nil
+}
+
+func registerOperationalRoutes(mux *http.ServeMux, store *identity.Store, metrics *appMetrics) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := store.Ping(r.Context()); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "not_ready", "database unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		writeMetrics(w, metrics)
+	})
+}
+
+func writeMetrics(w http.ResponseWriter, metrics *appMetrics) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "sisumail_http_requests_total %d\n", metrics.httpRequestsTotal.Load())
+	fmt.Fprintf(w, "sisumail_http_errors_total %d\n", metrics.httpErrorsTotal.Load())
+	fmt.Fprintf(w, "sisumail_http_auth_failures_total %d\n", metrics.httpAuthFailuresTotal.Load())
+	fmt.Fprintf(w, "sisumail_claims_total %d\n", metrics.claimsTotal.Load())
+	fmt.Fprintf(w, "sisumail_claim_failures_total %d\n", metrics.claimFailuresTotal.Load())
+	fmt.Fprintf(w, "sisumail_smtp_connections_current %d\n", metrics.smtpConnectionsCurrent.Load())
+	fmt.Fprintf(w, "sisumail_smtp_connections_total %d\n", metrics.smtpConnectionsTotal.Load())
+	fmt.Fprintf(w, "sisumail_smtp_accepted_total %d\n", metrics.smtpAcceptedTotal.Load())
+	fmt.Fprintf(w, "sisumail_smtp_rejected_total %d\n", metrics.smtpRejectedTotal.Load())
+	fmt.Fprintf(w, "sisumail_purge_removed_total %d\n", metrics.purgeRemovedTotal.Load())
 }
 
 func runPurgeWorker(ctx context.Context, store *identity.Store, interval time.Duration, metrics *appMetrics) {
