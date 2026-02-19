@@ -114,87 +114,7 @@ func main() {
 		log.Printf("site dir %q not found; landing routes disabled", *siteDir)
 	}
 	registerOperationalRoutes(mux, store, metrics)
-
-	mux.HandleFunc("/v1/claim", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		var req struct {
-			Username   string `json:"username"`
-			PubKey     string `json:"pubkey"`
-			InviteCode string `json:"invite_code"`
-		}
-		if err := decodeJSON(w, r, &req, *maxJSONBytes); err != nil {
-			handleDecodeErr(w, err)
-			return
-		}
-		src := sourceBucket(r.RemoteAddr)
-		acc, children, err := store.ClaimWithInvite(r.Context(), req.Username, req.PubKey, req.InviteCode, src, limits)
-		if err != nil {
-			metrics.claimFailuresTotal.Add(1)
-			switch err {
-			case identity.ErrInviteInvalid:
-				writeErr(w, http.StatusBadRequest, "invite_invalid", err.Error())
-			case identity.ErrInviteRedeemed:
-				writeErr(w, http.StatusConflict, "invite_redeemed", err.Error())
-			case identity.ErrClaimRateLimited:
-				writeErr(w, http.StatusTooManyRequests, "rate_limited", err.Error())
-			case identity.ErrUsernameTaken:
-				writeErr(w, http.StatusConflict, "username_taken", err.Error())
-			default:
-				log.Printf("claim failed remote=%q err=%v", r.RemoteAddr, err)
-				writeErr(w, http.StatusBadRequest, "claim_failed", "claim failed")
-			}
-			return
-		}
-		apiKey, err := store.IssueAPIKey(r.Context(), acc.Username)
-		if err != nil {
-			metrics.claimFailuresTotal.Add(1)
-			log.Printf("issue api key failed user=%q err=%v", acc.Username, err)
-			writeErr(w, http.StatusInternalServerError, "api_key_issue_failed", "internal error")
-			return
-		}
-		metrics.claimsTotal.Add(1)
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"username":      acc.Username,
-			"status":        acc.Status,
-			"child_invites": children,
-			"api_key":       apiKey,
-		})
-	})
-
-	mux.HandleFunc("/v1/admin/mint-invites", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		var req struct {
-			N int `json:"n"`
-		}
-		if err := decodeJSON(w, r, &req, *maxJSONBytes); err != nil && !errors.Is(err, io.EOF) {
-			handleDecodeErr(w, err)
-			return
-		}
-		if req.N <= 0 {
-			req.N = 1
-		}
-		codes, err := store.MintRootInvites(r.Context(), req.N)
-		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "invalid invite count") {
-				writeErr(w, http.StatusBadRequest, "mint_failed", "invalid invite count")
-			} else {
-				log.Printf("mint invites failed err=%v", err)
-				writeErr(w, http.StatusInternalServerError, "mint_failed", "internal error")
-			}
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"invites": codes})
-		auditLog(r, "admin.mint_invites", fmt.Sprintf("n=%d", req.N), "ok")
-	})
+	registerCoreAPIRoutes(mux, store, metrics, limits, adminTokens, adminCIDRs, *maxJSONBytes)
 
 	mux.HandleFunc("/v1/admin/accounts/", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
@@ -402,23 +322,6 @@ func main() {
 		auditLog(r, "admin.ack_invite_request", fmt.Sprintf("%d", id), "ok")
 	})
 
-	mux.HandleFunc("/v1/me/account", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		username, ok := userFromAPIKey(w, r, store)
-		if !ok {
-			return
-		}
-		acc, err := store.GetAccount(r.Context(), username)
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"account": acc})
-	})
-
 	mux.HandleFunc("/v1/me/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
@@ -456,24 +359,6 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
-	})
-
-	mux.HandleFunc("/v1/me/api-key/rotate", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		presented, ok := bearerToken(r)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "api key required")
-			return
-		}
-		username, newKey, err := store.RotateAPIKey(r.Context(), presented)
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"username": username, "api_key": newKey})
 	})
 
 	h := withLogging(mux, metrics)
@@ -754,6 +639,132 @@ func registerOperationalRoutes(mux *http.ServeMux, store *identity.Store, metric
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		writeMetrics(w, metrics)
+	})
+}
+
+func registerCoreAPIRoutes(
+	mux *http.ServeMux,
+	store *identity.Store,
+	metrics *appMetrics,
+	limits identity.ClaimLimits,
+	adminTokens []string,
+	adminCIDRs []netip.Prefix,
+	maxJSONBytes int64,
+) {
+	mux.HandleFunc("/v1/claim", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		var req struct {
+			Username   string `json:"username"`
+			PubKey     string `json:"pubkey"`
+			InviteCode string `json:"invite_code"`
+		}
+		if err := decodeJSON(w, r, &req, maxJSONBytes); err != nil {
+			handleDecodeErr(w, err)
+			return
+		}
+		src := sourceBucket(r.RemoteAddr)
+		acc, children, err := store.ClaimWithInvite(r.Context(), req.Username, req.PubKey, req.InviteCode, src, limits)
+		if err != nil {
+			metrics.claimFailuresTotal.Add(1)
+			switch err {
+			case identity.ErrInviteInvalid:
+				writeErr(w, http.StatusBadRequest, "invite_invalid", err.Error())
+			case identity.ErrInviteRedeemed:
+				writeErr(w, http.StatusConflict, "invite_redeemed", err.Error())
+			case identity.ErrClaimRateLimited:
+				writeErr(w, http.StatusTooManyRequests, "rate_limited", err.Error())
+			case identity.ErrUsernameTaken:
+				writeErr(w, http.StatusConflict, "username_taken", err.Error())
+			default:
+				log.Printf("claim failed remote=%q err=%v", r.RemoteAddr, err)
+				writeErr(w, http.StatusBadRequest, "claim_failed", "claim failed")
+			}
+			return
+		}
+		apiKey, err := store.IssueAPIKey(r.Context(), acc.Username)
+		if err != nil {
+			metrics.claimFailuresTotal.Add(1)
+			log.Printf("issue api key failed user=%q err=%v", acc.Username, err)
+			writeErr(w, http.StatusInternalServerError, "api_key_issue_failed", "internal error")
+			return
+		}
+		metrics.claimsTotal.Add(1)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"username":      acc.Username,
+			"status":        acc.Status,
+			"child_invites": children,
+			"api_key":       apiKey,
+		})
+	})
+
+	mux.HandleFunc("/v1/admin/mint-invites", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		var req struct {
+			N int `json:"n"`
+		}
+		if err := decodeJSON(w, r, &req, maxJSONBytes); err != nil && !errors.Is(err, io.EOF) {
+			handleDecodeErr(w, err)
+			return
+		}
+		if req.N <= 0 {
+			req.N = 1
+		}
+		codes, err := store.MintRootInvites(r.Context(), req.N)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "invalid invite count") {
+				writeErr(w, http.StatusBadRequest, "mint_failed", "invalid invite count")
+			} else {
+				log.Printf("mint invites failed err=%v", err)
+				writeErr(w, http.StatusInternalServerError, "mint_failed", "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"invites": codes})
+		auditLog(r, "admin.mint_invites", fmt.Sprintf("n=%d", req.N), "ok")
+	})
+
+	mux.HandleFunc("/v1/me/account", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		username, ok := userFromAPIKey(w, r, store)
+		if !ok {
+			return
+		}
+		acc, err := store.GetAccount(r.Context(), username)
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"account": acc})
+	})
+
+	mux.HandleFunc("/v1/me/api-key/rotate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		presented, ok := bearerToken(r)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "api key required")
+			return
+		}
+		username, newKey, err := store.RotateAPIKey(r.Context(), presented)
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"username": username, "api_key": newKey})
 	})
 }
 
