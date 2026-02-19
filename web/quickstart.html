@@ -9,40 +9,62 @@
 <body>
   <main class="container narrow">
     <p class="kicker"><a href="/">sisumail.fi</a></p>
-    <h1>User quickstart</h1>
-    <p class="lead">This is the fastest path from invite code to receiving encrypted messages.</p>
+    <h1>Quickstart</h1>
+    <p class="lead">Two tracks: use Sisumail in minutes, or integrate it as a developer.</p>
 
     <section class="card">
-      <h2>1. Claim account</h2>
-      <p>Open <a href="/apply">/apply</a>, submit your invite code, handle, and public key. Save your API key immediately.</p>
+      <h2>Before you start</h2>
+      <p>You need:</p>
+      <p>1. An invite code</p>
+      <p>2. A public key (for your encrypted payload workflow)</p>
+      <p>3. A terminal with <code>curl</code></p>
     </section>
 
     <section class="card">
-      <h2>2. Verify account access</h2>
-      <pre><code>curl -H "Authorization: Bearer &lt;API_KEY&gt;" \
+      <h2>Track A: Just use it</h2>
+      <p>1. Open <a href="/apply">/apply</a>.</p>
+      <p>2. Enter invite code, handle, and public key.</p>
+      <p>3. Save your API key (shown once).</p>
+      <p>4. Run this to confirm your account:</p>
+      <pre><code>curl -sS -H "Authorization: Bearer &lt;API_KEY&gt;" \
   https://sisumail.fi/v1/me/account</code></pre>
+      <p>Expected: JSON with your username and status <code>active</code>.</p>
     </section>
 
     <section class="card">
-      <h2>3. Send encrypted payload (SMTP)</h2>
-      <p>Recipient formats:</p>
-      <p><code>&lt;username&gt;@sisumail.fi</code> or <code>&lt;service&gt;@&lt;username&gt;.sisumail.fi</code></p>
-      <p>Payload must be ciphertext-like (`ciphertext:`, `age1`, or `ENC:` prefix).</p>
-      <pre><code>printf 'ciphertext:hello\\n' | \
-  sendmail youruser@sisumail.fi</code></pre>
-    </section>
-
-    <section class="card">
-      <h2>4. Read queued messages</h2>
-      <pre><code>curl -H "Authorization: Bearer &lt;API_KEY&gt;" \
+      <h2>Track B: Developer integration</h2>
+      <p>Set environment variables once:</p>
+      <pre><code>export SISUMAIL_API_KEY="&lt;API_KEY&gt;"
+export SISUMAIL_USER="&lt;username&gt;"</code></pre>
+      <p>Check account:</p>
+      <pre><code>curl -sS -H "Authorization: Bearer $SISUMAIL_API_KEY" \
+  https://sisumail.fi/v1/me/account</code></pre>
+      <p>Fetch queued messages:</p>
+      <pre><code>curl -sS -H "Authorization: Bearer $SISUMAIL_API_KEY" \
   https://sisumail.fi/v1/me/messages</code></pre>
+      <p>Rotate API key:</p>
+      <pre><code>curl -sS -X POST -H "Authorization: Bearer $SISUMAIL_API_KEY" \
+  https://sisumail.fi/v1/me/api-key/rotate</code></pre>
+      <p>Store the returned key and replace <code>SISUMAIL_API_KEY</code> immediately.</p>
     </section>
 
     <section class="card">
-      <h2>5. Rotate key</h2>
-      <pre><code>curl -X POST -H "Authorization: Bearer &lt;API_KEY&gt;" \
-  https://sisumail.fi/v1/me/api-key/rotate</code></pre>
-      <p>Store the new key. The old key is immediately revoked.</p>
+      <h2>SMTP delivery format</h2>
+      <p>Recipient address formats:</p>
+      <p><code>&lt;username&gt;@sisumail.fi</code></p>
+      <p><code>&lt;service&gt;@&lt;username&gt;.sisumail.fi</code></p>
+      <p>Payload must start with one of:</p>
+      <p><code>ciphertext:</code> or <code>age1</code> or <code>ENC:</code></p>
+      <p>Example (local sendmail-compatible client):</p>
+      <pre><code>printf 'ciphertext:hello\n' | sendmail "$SISUMAIL_USER@sisumail.fi"</code></pre>
+    </section>
+
+    <section class="card">
+      <h2>Troubleshooting</h2>
+      <p><code>401 unauthorized</code>: wrong/missing API key.</p>
+      <p><code>400 invite_invalid</code>: invite code is wrong/expired/redeemed.</p>
+      <p><code>409 username_taken</code>: handle already claimed.</p>
+      <p><code>550 plaintext rejected</code> (SMTP): payload does not look encrypted.</p>
     </section>
   </main>
 </body>
