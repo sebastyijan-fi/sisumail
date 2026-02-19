@@ -115,251 +115,7 @@ func main() {
 	}
 	registerOperationalRoutes(mux, store, metrics)
 	registerCoreAPIRoutes(mux, store, metrics, limits, adminTokens, adminCIDRs, *maxJSONBytes)
-
-	mux.HandleFunc("/v1/admin/accounts/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/v1/admin/accounts/")
-		path = strings.TrimSpace(path)
-		if path == "" {
-			writeErr(w, http.StatusNotFound, "not_found", "missing username")
-			return
-		}
-		if strings.HasSuffix(path, "/soft-delete") {
-			u := strings.TrimSuffix(path, "/soft-delete")
-			if r.Method != http.MethodPost {
-				writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-				return
-			}
-			if err := store.SoftDelete(r.Context(), u); err != nil {
-				mapIdentityErr(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"username": u, "status": identity.StatusSoftDeleted})
-			auditLog(r, "admin.soft_delete", u, "ok")
-			return
-		}
-		if strings.HasSuffix(path, "/restore") {
-			u := strings.TrimSuffix(path, "/restore")
-			if r.Method != http.MethodPost {
-				writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-				return
-			}
-			if err := store.Restore(r.Context(), u); err != nil {
-				mapIdentityErr(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"username": u, "status": identity.StatusActive})
-			auditLog(r, "admin.restore", u, "ok")
-			return
-		}
-		if r.Method != http.MethodGet {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		acc, err := store.GetAccount(r.Context(), path)
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"account": acc})
-	})
-
-	mux.HandleFunc("/v1/admin/messages", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		switch r.Method {
-		case http.MethodPost:
-			var req struct {
-				Username   string `json:"username"`
-				Alias      string `json:"alias"`
-				Sender     string `json:"sender"`
-				Ciphertext string `json:"ciphertext"`
-				TTLSeconds int    `json:"ttl_seconds"`
-			}
-			if err := decodeJSON(w, r, &req, *maxJSONBytes); err != nil {
-				handleDecodeErr(w, err)
-				return
-			}
-			ttl := 15 * time.Minute
-			if req.TTLSeconds > 0 {
-				ttl = time.Duration(req.TTLSeconds) * time.Second
-			}
-			msg, err := store.EnqueueCiphertext(r.Context(), req.Username, req.Alias, req.Sender, req.Ciphertext, ttl)
-			if err != nil {
-				mapIdentityErr(w, err)
-				return
-			}
-			writeJSON(w, http.StatusCreated, map[string]any{"message": msg})
-			auditLog(r, "admin.enqueue_message", req.Username, "ok")
-		case http.MethodGet:
-			u := strings.TrimSpace(r.URL.Query().Get("username"))
-			msgs, err := store.ListCiphertext(r.Context(), u, time.Now().UTC(), 200)
-			if err != nil {
-				mapIdentityErr(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": msgs})
-		default:
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-		}
-	})
-
-	mux.HandleFunc("/v1/admin/messages/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		if r.Method != http.MethodDelete {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/admin/messages/")
-		parts := strings.Split(strings.TrimSpace(rest), "/")
-		if len(parts) != 2 {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "expected /v1/admin/messages/{username}/{id}")
-			return
-		}
-		id, err := parseInt64(parts[1])
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid message id")
-			return
-		}
-		if err := store.DeleteMessage(r.Context(), parts[0], id); err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
-		auditLog(r, "admin.delete_message", fmt.Sprintf("%s/%d", parts[0], id), "ok")
-	})
-
-	mux.HandleFunc("/v1/admin/purge-expired", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		n, err := store.PurgeExpired(r.Context(), time.Now().UTC())
-		if err != nil {
-			log.Printf("purge expired failed err=%v", err)
-			writeErr(w, http.StatusInternalServerError, "purge_failed", "internal error")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"purged": n})
-		auditLog(r, "admin.purge_expired", fmt.Sprintf("purged=%d", n), "ok")
-	})
-
-	mux.HandleFunc("/v1/invite-requests", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		var req struct {
-			Email string `json:"email"`
-			Note  string `json:"note"`
-		}
-		if err := decodeJSON(w, r, &req, *maxJSONBytes); err != nil {
-			handleDecodeErr(w, err)
-			return
-		}
-		ir, err := store.CreateInviteRequest(r.Context(), req.Email, req.Note, sourceBucket(r.RemoteAddr))
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"request_id": ir.ID,
-			"status":     ir.Status,
-			"message":    "Invite request received",
-		})
-	})
-
-	mux.HandleFunc("/v1/admin/invite-requests", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		status := strings.TrimSpace(r.URL.Query().Get("status"))
-		items, err := store.ListInviteRequests(r.Context(), status, 200)
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
-	})
-
-	mux.HandleFunc("/v1/admin/invite-requests/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/admin/invite-requests/")
-		if !strings.HasSuffix(rest, "/ack") {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "expected /v1/admin/invite-requests/{id}/ack")
-			return
-		}
-		idPart := strings.TrimSuffix(rest, "/ack")
-		idPart = strings.Trim(idPart, "/")
-		id, err := parseInt64(idPart)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid request id")
-			return
-		}
-		if err := store.AcknowledgeInviteRequest(r.Context(), id); err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": identity.InviteRequestAcknowledged})
-		auditLog(r, "admin.ack_invite_request", fmt.Sprintf("%d", id), "ok")
-	})
-
-	mux.HandleFunc("/v1/me/messages", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		username, ok := userFromAPIKey(w, r, store)
-		if !ok {
-			return
-		}
-		msgs, err := store.ListCiphertext(r.Context(), username, time.Now().UTC(), 200)
-		if err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": msgs})
-	})
-
-	mux.HandleFunc("/v1/me/messages/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
-		username, ok := userFromAPIKey(w, r, store)
-		if !ok {
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/me/messages/")
-		id, err := parseInt64(rest)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid message id")
-			return
-		}
-		if err := store.DeleteMessage(r.Context(), username, id); err != nil {
-			mapIdentityErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
-	})
+	registerRemainingAPIRoutes(mux, store, metrics, adminTokens, adminCIDRs, *maxJSONBytes)
 
 	h := withLogging(mux, metrics)
 	log.Printf("relay api listening on %s", *listen)
@@ -765,6 +521,260 @@ func registerCoreAPIRoutes(
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"username": username, "api_key": newKey})
+	})
+}
+
+func registerRemainingAPIRoutes(
+	mux *http.ServeMux,
+	store *identity.Store,
+	metrics *appMetrics,
+	adminTokens []string,
+	adminCIDRs []netip.Prefix,
+	maxJSONBytes int64,
+) {
+	mux.HandleFunc("/v1/admin/accounts/", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/v1/admin/accounts/")
+		path = strings.TrimSpace(path)
+		if path == "" {
+			writeErr(w, http.StatusNotFound, "not_found", "missing username")
+			return
+		}
+		if strings.HasSuffix(path, "/soft-delete") {
+			u := strings.TrimSuffix(path, "/soft-delete")
+			if r.Method != http.MethodPost {
+				writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+				return
+			}
+			if err := store.SoftDelete(r.Context(), u); err != nil {
+				mapIdentityErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"username": u, "status": identity.StatusSoftDeleted})
+			auditLog(r, "admin.soft_delete", u, "ok")
+			return
+		}
+		if strings.HasSuffix(path, "/restore") {
+			u := strings.TrimSuffix(path, "/restore")
+			if r.Method != http.MethodPost {
+				writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+				return
+			}
+			if err := store.Restore(r.Context(), u); err != nil {
+				mapIdentityErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"username": u, "status": identity.StatusActive})
+			auditLog(r, "admin.restore", u, "ok")
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		acc, err := store.GetAccount(r.Context(), path)
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"account": acc})
+	})
+
+	mux.HandleFunc("/v1/admin/messages", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		switch r.Method {
+		case http.MethodPost:
+			var req struct {
+				Username   string `json:"username"`
+				Alias      string `json:"alias"`
+				Sender     string `json:"sender"`
+				Ciphertext string `json:"ciphertext"`
+				TTLSeconds int    `json:"ttl_seconds"`
+			}
+			if err := decodeJSON(w, r, &req, maxJSONBytes); err != nil {
+				handleDecodeErr(w, err)
+				return
+			}
+			ttl := 15 * time.Minute
+			if req.TTLSeconds > 0 {
+				ttl = time.Duration(req.TTLSeconds) * time.Second
+			}
+			msg, err := store.EnqueueCiphertext(r.Context(), req.Username, req.Alias, req.Sender, req.Ciphertext, ttl)
+			if err != nil {
+				mapIdentityErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]any{"message": msg})
+			auditLog(r, "admin.enqueue_message", req.Username, "ok")
+		case http.MethodGet:
+			u := strings.TrimSpace(r.URL.Query().Get("username"))
+			msgs, err := store.ListCiphertext(r.Context(), u, time.Now().UTC(), 200)
+			if err != nil {
+				mapIdentityErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"items": msgs})
+		default:
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+		}
+	})
+
+	mux.HandleFunc("/v1/admin/messages/", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		if r.Method != http.MethodDelete {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/admin/messages/")
+		parts := strings.Split(strings.TrimSpace(rest), "/")
+		if len(parts) != 2 {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "expected /v1/admin/messages/{username}/{id}")
+			return
+		}
+		id, err := parseInt64(parts[1])
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid message id")
+			return
+		}
+		if err := store.DeleteMessage(r.Context(), parts[0], id); err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+		auditLog(r, "admin.delete_message", fmt.Sprintf("%s/%d", parts[0], id), "ok")
+	})
+
+	mux.HandleFunc("/v1/admin/purge-expired", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		n, err := store.PurgeExpired(r.Context(), time.Now().UTC())
+		if err != nil {
+			log.Printf("purge expired failed err=%v", err)
+			writeErr(w, http.StatusInternalServerError, "purge_failed", "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"purged": n})
+		auditLog(r, "admin.purge_expired", fmt.Sprintf("purged=%d", n), "ok")
+	})
+
+	mux.HandleFunc("/v1/invite-requests", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		var req struct {
+			Email string `json:"email"`
+			Note  string `json:"note"`
+		}
+		if err := decodeJSON(w, r, &req, maxJSONBytes); err != nil {
+			handleDecodeErr(w, err)
+			return
+		}
+		ir, err := store.CreateInviteRequest(r.Context(), req.Email, req.Note, sourceBucket(r.RemoteAddr))
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"request_id": ir.ID,
+			"status":     ir.Status,
+			"message":    "Invite request received",
+		})
+	})
+
+	mux.HandleFunc("/v1/admin/invite-requests", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		status := strings.TrimSpace(r.URL.Query().Get("status"))
+		items, err := store.ListInviteRequests(r.Context(), status, 200)
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	})
+
+	mux.HandleFunc("/v1/admin/invite-requests/", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/admin/invite-requests/")
+		if !strings.HasSuffix(rest, "/ack") {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "expected /v1/admin/invite-requests/{id}/ack")
+			return
+		}
+		idPart := strings.TrimSuffix(rest, "/ack")
+		idPart = strings.Trim(idPart, "/")
+		id, err := parseInt64(idPart)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid request id")
+			return
+		}
+		if err := store.AcknowledgeInviteRequest(r.Context(), id); err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": identity.InviteRequestAcknowledged})
+		auditLog(r, "admin.ack_invite_request", fmt.Sprintf("%d", id), "ok")
+	})
+
+	mux.HandleFunc("/v1/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		username, ok := userFromAPIKey(w, r, store)
+		if !ok {
+			return
+		}
+		msgs, err := store.ListCiphertext(r.Context(), username, time.Now().UTC(), 200)
+		if err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": msgs})
+	})
+
+	mux.HandleFunc("/v1/me/messages/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			writeErr(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+			return
+		}
+		username, ok := userFromAPIKey(w, r, store)
+		if !ok {
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/me/messages/")
+		id, err := parseInt64(rest)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid message id")
+			return
+		}
+		if err := store.DeleteMessage(r.Context(), username, id); err != nil {
+			mapIdentityErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 	})
 }
 
