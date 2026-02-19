@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -41,5 +42,28 @@ func TestDecodeJSONLimit(t *testing.T) {
 	handleDecodeErr(w, err)
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", w.Code)
+	}
+}
+
+func TestParseCIDRs(t *testing.T) {
+	cidrs, err := parseCIDRs("10.0.0.0/8, 127.0.0.1/32")
+	if err != nil {
+		t.Fatalf("parseCIDRs error: %v", err)
+	}
+	if len(cidrs) != 2 {
+		t.Fatalf("expected 2 cidrs, got %d", len(cidrs))
+	}
+}
+
+func TestIsRemoteAllowed(t *testing.T) {
+	cidrs := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("127.0.0.1/32"),
+	}
+	if !isRemoteAllowed("127.0.0.1:9999", cidrs) {
+		t.Fatal("expected localhost allowed")
+	}
+	if isRemoteAllowed("192.168.1.10:9999", cidrs) {
+		t.Fatal("expected 192.168.1.10 blocked")
 	}
 }

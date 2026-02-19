@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,6 +66,7 @@ func main() {
 		dbPath                = flag.String("db", "./sisumail-relay.db", "sqlite db path")
 		pepper                = flag.String("invite-pepper", "", "invite hash pepper")
 		adminToken            = flag.String("admin-token", "", "admin bearer token(s), comma-separated")
+		adminAllowCIDRs       = flag.String("admin-allow-cidrs", "", "optional comma-separated CIDRs allowed for admin API access")
 		purgeInterval         = flag.Duration("purge-interval", 30*time.Second, "expired spool purge interval (0 disables)")
 		siteDir               = flag.String("site-dir", "./web", "landing page directory")
 		maxJSONBytes          = flag.Int64("max-json-bytes", 1<<20, "maximum bytes accepted for JSON API bodies")
@@ -98,6 +100,10 @@ func main() {
 	}
 	metrics := &appMetrics{}
 	adminTokens := parseAdminTokens(*adminToken)
+	adminCIDRs, err := parseCIDRs(*adminAllowCIDRs)
+	if err != nil {
+		log.Fatalf("invalid admin allow cidrs: %v", err)
+	}
 	store.SetMaxCiphertextBytes(*maxCiphertextBytes)
 	store.SetAPIKeyRetention(*apiKeyRetention)
 
@@ -181,7 +187,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/mint-invites", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -213,7 +219,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/accounts/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/v1/admin/accounts/")
@@ -263,7 +269,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/messages", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		switch r.Method {
@@ -304,7 +310,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/messages/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		if r.Method != http.MethodDelete {
@@ -331,7 +337,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/purge-expired", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -374,7 +380,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/invite-requests", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		if r.Method != http.MethodGet {
@@ -391,7 +397,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/admin/invite-requests/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, adminTokens, metrics) {
+		if !requireAdmin(w, r, adminTokens, adminCIDRs, metrics) {
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -539,6 +545,7 @@ func withLogging(next http.Handler, metrics *appMetrics) http.Handler {
 		start := time.Now()
 		rid := requestID()
 		sw := &statusWriter{ResponseWriter: w}
+		applySecurityHeaders(sw.Header())
 		sw.Header().Set("X-Request-ID", rid)
 		metrics.httpRequestsTotal.Add(1)
 		next.ServeHTTP(sw, r)
@@ -558,7 +565,12 @@ func sourceBucket(remote string) string {
 	return h
 }
 
-func requireAdmin(w http.ResponseWriter, r *http.Request, tokens []string, metrics *appMetrics) bool {
+func requireAdmin(w http.ResponseWriter, r *http.Request, tokens []string, cidrs []netip.Prefix, metrics *appMetrics) bool {
+	if !isRemoteAllowed(r.RemoteAddr, cidrs) {
+		metrics.httpAuthFailuresTotal.Add(1)
+		writeErr(w, http.StatusForbidden, "forbidden", "admin source not allowed")
+		return false
+	}
 	presented, ok := bearerToken(r)
 	if !ok || !isValidAdminToken(presented, tokens) {
 		metrics.httpAuthFailuresTotal.Add(1)
@@ -566,6 +578,13 @@ func requireAdmin(w http.ResponseWriter, r *http.Request, tokens []string, metri
 		return false
 	}
 	return true
+}
+
+func applySecurityHeaders(h http.Header) {
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 }
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -655,6 +674,43 @@ func parseAdminTokens(raw string) []string {
 		out = append(out, t)
 	}
 	return out
+}
+
+func parseCIDRs(raw string) ([]netip.Prefix, error) {
+	parts := strings.Split(raw, ",")
+	out := make([]netip.Prefix, 0, len(parts))
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t == "" {
+			continue
+		}
+		pr, err := netip.ParsePrefix(t)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pr)
+	}
+	return out, nil
+}
+
+func isRemoteAllowed(remote string, cidrs []netip.Prefix) bool {
+	if len(cidrs) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remote))
+	if err != nil {
+		host = strings.TrimSpace(remote)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	for _, pr := range cidrs {
+		if pr.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidAdminToken(presented string, tokens []string) bool {

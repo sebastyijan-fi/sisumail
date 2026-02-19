@@ -27,6 +27,7 @@ go run ./cmd/sisumail-relay \
   -site-dir ./web \
   -invite-pepper "change-me" \
   -admin-token "change-me-admin" \
+  -admin-allow-cidrs "127.0.0.1/32,10.0.0.0/8" \
   -max-json-bytes 1048576 \
   -max-ciphertext-bytes 262144 \
   -smtp-max-data-bytes 262144 \
@@ -85,3 +86,8 @@ Ops endpoints:
 - `GET /healthz` -> liveness
 - `GET /readyz` -> readiness (DB ping)
 - `GET /metrics` -> Prometheus-style counters
+
+Security defaults:
+
+- Admin API can be IP allow-listed using `-admin-allow-cidrs`.
+- HTTP responses include defensive headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`).
