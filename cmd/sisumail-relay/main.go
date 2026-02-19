@@ -889,6 +889,8 @@ func serveStaticSite(mux *http.ServeMux, siteDir string) {
 			http.ServeFile(w, r, filepath.Join(siteDir, "apply.html"))
 		case "/quickstart":
 			http.ServeFile(w, r, filepath.Join(siteDir, "quickstart.html"))
+		case "/inboxes":
+			http.ServeFile(w, r, filepath.Join(siteDir, "inboxes.html"))
 		default:
 			http.NotFound(w, r)
 		}

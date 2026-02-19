@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Manage Inboxes - Sisumail</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main class="container">
+    <p class="kicker"><a href="/">sisumail.fi</a></p>
+    <h1>Identity inbox manager</h1>
+    <p class="lead">Manage multiple Sisumail identities from one page using your existing API keys.</p>
+
+    <section class="card">
+      <h2>Add inbox identity</h2>
+      <form id="add-form">
+        <label for="label">Label</label>
+        <input id="label" name="label" placeholder="Work, Personal, Team A" required>
+        <label for="api_key">API key</label>
+        <input id="api_key" name="api_key" placeholder="smk_..." required>
+        <div class="actions">
+          <button class="btn primary" type="submit">Add identity</button>
+        </div>
+      </form>
+      <p class="hint">Stored in this browser only (localStorage).</p>
+      <section id="add-result" class="hidden" aria-live="polite"></section>
+    </section>
+
+    <section class="card">
+      <h2>Your identities</h2>
+      <div id="profiles" class="profile-grid"></div>
+    </section>
+
+    <section id="active-section" class="card hidden">
+      <h2 id="active-title">Active identity</h2>
+      <p id="active-meta" class="hint"></p>
+      <div class="actions">
+        <button class="btn" id="refresh-btn" type="button">Refresh messages</button>
+        <button class="btn" id="rotate-btn" type="button">Rotate API key</button>
+      </div>
+      <h3>Inbox aliases</h3>
+      <div id="alias-list"></div>
+      <h3>Messages</h3>
+      <div id="messages"></div>
+    </section>
+  </main>
+
+  <script>
+    const STORAGE_KEY = "sisumail_identities_v1";
+    let profiles = [];
+    let activeId = null;
+
+    const esc = (s) => String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    const byId = (id) => document.getElementById(id);
+
+    function loadProfiles() {
+      try {
+        profiles = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+      } catch (_) {
+        profiles = [];
+      }
+    }
+
+    function saveProfiles() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(profiles));
+    }
+
+    function activeProfile() {
+      return profiles.find((p) => p.id === activeId) || null;
+    }
+
+    async function api(path, apiKey, method = "GET") {
+      const res = await fetch(path, {
+        method,
+        headers: {"Authorization": "Bearer " + apiKey}
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error?.message || ("Request failed: " + res.status));
+      }
+      return data;
+    }
+
+    function renderProfiles() {
+      const wrap = byId("profiles");
+      if (!profiles.length) {
+        wrap.innerHTML = "<p class='hint'>No identities added yet.</p>";
+        byId("active-section").classList.add("hidden");
+        return;
+      }
+      wrap.innerHTML = profiles.map((p) => {
+        const active = p.id === activeId ? "active" : "";
+        return "<article class='profile-card " + active + "'>" +
+          "<h3>" + esc(p.label) + "</h3>" +
+          "<p class='hint'>@" + esc(p.username || "unknown") + "</p>" +
+          "<div class='actions'>" +
+          "<button class='btn' data-action='select' data-id='" + esc(p.id) + "'>Select</button>" +
+          "<button class='btn danger' data-action='remove' data-id='" + esc(p.id) + "'>Remove</button>" +
+          "</div>" +
+          "</article>";
+      }).join("");
+    }
+
+    async function renderActive() {
+      const section = byId("active-section");
+      const p = activeProfile();
+      if (!p) {
+        section.classList.add("hidden");
+        return;
+      }
+      section.classList.remove("hidden");
+      byId("active-title").textContent = "Active: " + p.label;
+      byId("active-meta").textContent = "@" + (p.username || "unknown");
+      try {
+        const me = await api("/v1/me/account", p.api_key);
+        p.username = me?.account?.username || p.username;
+        p.status = me?.account?.status || "";
+        saveProfiles();
+        byId("active-meta").textContent = "@" + (p.username || "unknown") + " (" + (p.status || "unknown") + ")";
+        const list = await api("/v1/me/messages", p.api_key);
+        const items = Array.isArray(list.items) ? list.items : [];
+        const aliasCounts = {};
+        for (const m of items) {
+          aliasCounts[m.alias || "unknown"] = (aliasCounts[m.alias || "unknown"] || 0) + 1;
+        }
+        const aliases = Object.keys(aliasCounts).sort();
+        byId("alias-list").innerHTML = aliases.length
+          ? aliases.map((a) => "<span class='chip'>" + esc(a) + " (" + aliasCounts[a] + ")</span>").join(" ")
+          : "<p class='hint'>No aliases with queued messages yet.</p>";
+
+        byId("messages").innerHTML = items.length
+          ? "<table><thead><tr><th>ID</th><th>Alias</th><th>From</th><th>Expires</th><th></th></tr></thead><tbody>" +
+            items.map((m) =>
+              "<tr><td>" + esc(m.id) + "</td><td>" + esc(m.alias) + "</td><td>" + esc(m.sender) + "</td><td>" + esc(m.expires_at) + "</td>" +
+              "<td><button class='btn danger' data-action='delete-msg' data-id='" + esc(m.id) + "'>Delete</button></td></tr>"
+            ).join("") +
+            "</tbody></table>"
+          : "<p class='hint'>No queued messages.</p>";
+      } catch (err) {
+        byId("alias-list").innerHTML = "<p class='hint'>Failed: " + esc(err.message || err) + "</p>";
+        byId("messages").innerHTML = "";
+      }
+    }
+
+    byId("add-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const label = byId("label").value.trim();
+      const api_key = byId("api_key").value.trim();
+      const result = byId("add-result");
+      result.classList.remove("hidden");
+      result.textContent = "Checking key...";
+      try {
+        const me = await api("/v1/me/account", api_key);
+        const username = me?.account?.username || "";
+        const id = "id_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+        profiles.push({id, label, api_key, username});
+        saveProfiles();
+        activeId = id;
+        byId("add-form").reset();
+        result.textContent = "Added @" + username;
+        renderProfiles();
+        await renderActive();
+      } catch (err) {
+        result.textContent = "Failed: " + (err.message || err);
+      }
+    });
+
+    byId("profiles").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-action]");
+      if (!btn) return;
+      const action = btn.getAttribute("data-action");
+      const id = btn.getAttribute("data-id");
+      if (!id) return;
+      if (action === "select") {
+        activeId = id;
+        renderProfiles();
+        await renderActive();
+      } else if (action === "remove") {
+        profiles = profiles.filter((p) => p.id !== id);
+        if (activeId === id) activeId = profiles[0]?.id || null;
+        saveProfiles();
+        renderProfiles();
+        await renderActive();
+      }
+    });
+
+    byId("refresh-btn").addEventListener("click", async () => {
+      await renderActive();
+    });
+
+    byId("rotate-btn").addEventListener("click", async () => {
+      const p = activeProfile();
+      if (!p) return;
+      try {
+        const data = await api("/v1/me/api-key/rotate", p.api_key, "POST");
+        p.api_key = data.api_key;
+        saveProfiles();
+        alert("API key rotated for @" + (p.username || ""));
+      } catch (err) {
+        alert("Rotate failed: " + (err.message || err));
+      }
+    });
+
+    byId("messages").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-action='delete-msg']");
+      if (!btn) return;
+      const id = btn.getAttribute("data-id");
+      const p = activeProfile();
+      if (!p || !id) return;
+      try {
+        await api("/v1/me/messages/" + encodeURIComponent(id), p.api_key, "DELETE");
+        await renderActive();
+      } catch (err) {
+        alert("Delete failed: " + (err.message || err));
+      }
+    });
+
+    loadProfiles();
+    if (profiles.length) activeId = profiles[0].id;
+    renderProfiles();
+    renderActive();
+  </script>
+</body>
+</html>

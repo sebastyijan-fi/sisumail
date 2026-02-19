@@ -70,6 +70,11 @@ h1 {
   color: var(--brand-ink);
 }
 
+.btn.danger {
+  border-color: #b42318;
+  color: #b42318;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -101,4 +106,54 @@ textarea {
 
 .hidden {
   display: none;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.profile-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.profile-card.active {
+  border-color: var(--brand);
+}
+
+.chip {
+  display: inline-block;
+  padding: 4px 8px;
+  margin: 4px 6px 0 0;
+  background: #edf3f8;
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  padding: 8px;
+  vertical-align: top;
+}
+
+pre {
+  background: #0f1720;
+  color: #e6edf4;
+  border-radius: 10px;
+  padding: 12px;
+  overflow: auto;
 }
