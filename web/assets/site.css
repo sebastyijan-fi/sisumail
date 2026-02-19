@@ -1,0 +1,104 @@
+:root {
+  --bg: #f3f5f7;
+  --ink: #11212d;
+  --muted: #4a6070;
+  --surface: #ffffff;
+  --line: #d6dde3;
+  --brand: #0a6a66;
+  --brand-ink: #e9fffd;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at top left, #e6ecef, var(--bg) 40%);
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 64px 20px;
+}
+
+.container.narrow {
+  max-width: 720px;
+}
+
+.kicker {
+  margin: 0 0 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+h1 {
+  margin: 0 0 16px;
+  line-height: 1.08;
+  font-size: clamp(30px, 5vw, 52px);
+}
+
+.lead {
+  margin: 0 0 22px;
+  color: var(--muted);
+  max-width: 60ch;
+  font-size: 18px;
+}
+
+.actions {
+  margin-top: 24px;
+}
+
+.btn {
+  display: inline-block;
+  padding: 11px 18px;
+  border-radius: 10px;
+  text-decoration: none;
+  border: 1px solid transparent;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 16px;
+  margin-top: 18px;
+}
+
+label {
+  display: block;
+  margin-top: 10px;
+  margin-bottom: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font: inherit;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.hidden {
+  display: none;
+}

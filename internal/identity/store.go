@@ -6,620 +6,392 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
+	"regexp"
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
 	_ "modernc.org/sqlite"
 )
 
-type Store struct {
-	db *sql.DB
-}
+var (
+	ErrInviteInvalid    = errors.New("invite invalid")
+	ErrInviteRedeemed   = errors.New("invite redeemed")
+	ErrClaimRateLimited = errors.New("claim rate limited")
+	ErrUsernameTaken    = errors.New("username already claimed")
+	ErrNotFound         = errors.New("not found")
+	ErrUnauthorized     = errors.New("unauthorized")
+)
 
-var ErrClaimRateLimited = errors.New("claim rate limited")
+var usernameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,31}$`)
 
-type ClaimLimits struct {
-	// PerSourcePerHour limits the number of *new* identity claims per bucket per hour.
-	// (IPv4 buckets are typically /24, IPv6 buckets typically /64.)
-	PerSourcePerHour int
-	PerSourcePerDay  int
-	GlobalPerHour    int
-	GlobalPerDay     int
+type AccountStatus string
 
-	// RetentionDays controls how long we keep claim_log rows (0 disables pruning).
-	// This only needs to cover the longest window (day); keep it > 1 in practice.
-	RetentionDays int
-}
-
-func Open(dbPath string) (*Store, error) {
-	// modernc.org/sqlite is pure Go and works without CGO.
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, err
-	}
-	// Improve concurrency characteristics:
-	// - WAL allows concurrent readers while a writer is active.
-	// - busy_timeout makes concurrent writes wait briefly instead of failing fast.
-	// If these pragmas fail, continue; the DB will still work, just more lock-prone.
-	_, _ = db.Exec(`PRAGMA journal_mode = WAL;`)
-	_, _ = db.Exec(`PRAGMA busy_timeout = 5000;`) // milliseconds
-	// Keep this conservative; the relay should not hold long SQLite locks.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-	return &Store{db: db}, nil
-}
-
-func (s *Store) Close() error { return s.db.Close() }
-
-func (s *Store) Init(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS identities (
-  username    TEXT PRIMARY KEY,
-  pubkey      TEXT NOT NULL,
-  fingerprint TEXT NOT NULL UNIQUE,
-  ipv6_addr   TEXT NOT NULL UNIQUE,
-  allow_tier2 INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL,
-  last_seen   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS alloc_state (
-  id         INTEGER PRIMARY KEY CHECK (id = 1),
-  next_host  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS claim_log (
-  ts_unix       INTEGER NOT NULL,
-  source_bucket TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_claim_log_ts ON claim_log(ts_unix);
-CREATE INDEX IF NOT EXISTS idx_claim_log_bucket_ts ON claim_log(source_bucket, ts_unix);
-
-CREATE TABLE IF NOT EXISTS invites (
-  code_hash    TEXT PRIMARY KEY,
-  parent_hash  TEXT,
-  level        INTEGER NOT NULL,
-  created_at   TEXT NOT NULL,
-  redeemed_by  TEXT,
-  redeemed_at  TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_invites_parent ON invites(parent_hash);
-CREATE INDEX IF NOT EXISTS idx_invites_redeemed_by ON invites(redeemed_by);
-`)
-	if err != nil {
-		return err
-	}
-	// Best-effort schema upgrade for older deployments.
-	_, _ = s.db.ExecContext(ctx, `ALTER TABLE identities ADD COLUMN allow_tier2 INTEGER NOT NULL DEFAULT 0;`)
-	return nil
-}
-
-type Identity struct {
-	Username    string
-	PubKey      ssh.PublicKey
-	PubKeyText  string
-	Fingerprint string
-	IPv6        net.IP
-	AllowTier2  bool
-	CreatedAt   time.Time
-	LastSeen    *time.Time
-}
-
-func FingerprintSHA256(pub ssh.PublicKey) string {
-	sum := sha256.Sum256(pub.Marshal())
-	return "SHA256:" + base64.StdEncoding.EncodeToString(sum[:])
-}
-
-func (s *Store) Put(ctx context.Context, username string, pubKeyText string, ipv6 net.IP) error {
-	u, err := CanonicalUsername(username)
-	if err != nil {
-		return err
-	}
-	if ipv6 == nil || ipv6.To16() == nil || ipv6.To4() != nil {
-		return fmt.Errorf("ipv6 must be a valid IPv6 address")
-	}
-	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubKeyText))
-	if err != nil {
-		return fmt.Errorf("parse pubkey: %w", err)
-	}
-	fp := FingerprintSHA256(pub)
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-
-	_, err = s.db.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
-VALUES (?, ?, ?, ?, 0, ?)
-ON CONFLICT(username) DO UPDATE SET
-  pubkey=excluded.pubkey,
-  fingerprint=excluded.fingerprint,
-  ipv6_addr=excluded.ipv6_addr
-`, u, pubKeyText, fp, ipv6.String(), now)
-	return err
-}
-
-// Claim creates a new identity if unclaimed, allocating an IPv6 from the given /64.
-// If the username already exists, it verifies the key matches and returns the existing record.
-//
-// This is the relay's v1 "no recovery" model: first key to claim binds the name.
-//
-// For open first-claim deployments, operators SHOULD enable claim limits to reduce squatting.
-func (s *Store) Claim(ctx context.Context, username string, pubKey ssh.PublicKey, ipv6Prefix *net.IPNet, sourceBucket string, limits ClaimLimits) (*Identity, bool, error) {
-	u, err := CanonicalUsername(username)
-	if err != nil {
-		return nil, false, err
-	}
-	if pubKey == nil {
-		return nil, false, fmt.Errorf("missing pubkey")
-	}
-	if ipv6Prefix == nil || ipv6Prefix.IP == nil || ipv6Prefix.IP.To16() == nil {
-		return nil, false, fmt.Errorf("invalid ipv6 prefix")
-	}
-	ones, bits := ipv6Prefix.Mask.Size()
-	if bits != 128 || ones != 64 {
-		return nil, false, fmt.Errorf("ipv6 prefix must be /64")
-	}
-
-	sourceBucket = strings.TrimSpace(sourceBucket)
-	if sourceBucket == "" {
-		sourceBucket = "unknown"
-	}
-
-	// Allocate + enforce limits inside a transaction so concurrent claims don't collide.
-	var allocated net.IP
-	pubKeyText := string(ssh.MarshalAuthorizedKey(pubKey))
-	fp := FingerprintSHA256(pubKey)
-	now := time.Now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	nowUnix := now.Unix()
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	// First check if it already exists.
-	existing, err := getByUsernameTx(ctx, tx, u)
-	if err != nil {
-		return nil, false, err
-	}
-	if existing != nil {
-		if subtleComparePub(existing.PubKey, pubKey) {
-			return existing, false, nil
-		}
-		return nil, false, fmt.Errorf("username claimed by different key")
-	}
-
-	if err := enforceClaimLimits(ctx, tx, sourceBucket, nowUnix, limits); err != nil {
-		return nil, false, err
-	}
-
-	nextHost, err := allocNextHost(ctx, tx)
-	if err != nil {
-		return nil, false, err
-	}
-	allocated, err = ipv6FromHost(ipv6Prefix, nextHost)
-	if err != nil {
-		return nil, false, err
-	}
-	if err := bumpNextHost(ctx, tx, nextHost+1); err != nil {
-		return nil, false, err
-	}
-
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
-VALUES (?, ?, ?, ?, 0, ?)
-`, u, pubKeyText, fp, allocated.String(), nowText)
-	if err != nil {
-		return nil, false, err
-	}
-
-	_, err = tx.ExecContext(ctx, `INSERT INTO claim_log (ts_unix, source_bucket) VALUES (?, ?)`, nowUnix, sourceBucket)
-	if err != nil {
-		return nil, false, err
-	}
-	if err := pruneClaimLog(ctx, tx, nowUnix, limits.RetentionDays); err != nil {
-		return nil, false, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
-	}
-
-	return &Identity{
-		Username:    u,
-		PubKey:      pubKey,
-		PubKeyText:  pubKeyText,
-		Fingerprint: fp,
-		IPv6:        allocated,
-		CreatedAt:   now,
-		LastSeen:    nil,
-	}, true, nil
-}
-
-func getByUsernameTx(ctx context.Context, tx *sql.Tx, username string) (*Identity, error) {
-	row := tx.QueryRowContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
-FROM identities WHERE username = ?
-`, username)
-	var (
-		u, pkText, fp, ipStr, created, last sql.NullString
-		allowTier2           sql.NullInt64
-	)
-	if err := row.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pkText.String))
-	if err != nil {
-		return nil, err
-	}
-	ip := net.ParseIP(ipStr.String)
-	if ip == nil {
-		return nil, fmt.Errorf("invalid ipv6 in db")
-	}
-	ct, err := time.Parse(time.RFC3339Nano, created.String)
-	if err != nil {
-		return nil, err
-	}
-	var lt *time.Time
-	if last.Valid && last.String != "" {
-		tm, err := time.Parse(time.RFC3339Nano, last.String)
-		if err == nil {
-			lt = &tm
-		}
-	}
-	return &Identity{
-		Username:    u.String,
-		PubKey:      pub,
-		PubKeyText:  pkText.String,
-		Fingerprint: fp.String,
-		IPv6:        ip,
-		AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
-		CreatedAt:   ct,
-		LastSeen:    lt,
-	}, nil
-}
-
-func enforceClaimLimits(ctx context.Context, tx *sql.Tx, sourceBucket string, nowUnix int64, lim ClaimLimits) error {
-	// 0/negative limits disable that dimension.
-	hourStart := nowUnix - 3600
-	dayStart := nowUnix - 86400
-
-	if lim.PerSourcePerHour > 0 {
-		c, err := countClaimsSince(ctx, tx, sourceBucket, hourStart)
-		if err != nil {
-			return err
-		}
-		if c >= lim.PerSourcePerHour {
-			return ErrClaimRateLimited
-		}
-	}
-	if lim.PerSourcePerDay > 0 {
-		c, err := countClaimsSince(ctx, tx, sourceBucket, dayStart)
-		if err != nil {
-			return err
-		}
-		if c >= lim.PerSourcePerDay {
-			return ErrClaimRateLimited
-		}
-	}
-	if lim.GlobalPerHour > 0 {
-		c, err := countClaimsGlobalSince(ctx, tx, hourStart)
-		if err != nil {
-			return err
-		}
-		if c >= lim.GlobalPerHour {
-			return ErrClaimRateLimited
-		}
-	}
-	if lim.GlobalPerDay > 0 {
-		c, err := countClaimsGlobalSince(ctx, tx, dayStart)
-		if err != nil {
-			return err
-		}
-		if c >= lim.GlobalPerDay {
-			return ErrClaimRateLimited
-		}
-	}
-	return nil
-}
-
-func countClaimsSince(ctx context.Context, tx *sql.Tx, sourceBucket string, sinceUnix int64) (int, error) {
-	row := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM claim_log WHERE source_bucket = ? AND ts_unix >= ?`, sourceBucket, sinceUnix)
-	var c int
-	if err := row.Scan(&c); err != nil {
-		return 0, err
-	}
-	return c, nil
-}
-
-func countClaimsGlobalSince(ctx context.Context, tx *sql.Tx, sinceUnix int64) (int, error) {
-	row := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM claim_log WHERE ts_unix >= ?`, sinceUnix)
-	var c int
-	if err := row.Scan(&c); err != nil {
-		return 0, err
-	}
-	return c, nil
-}
-
-func pruneClaimLog(ctx context.Context, tx *sql.Tx, nowUnix int64, retentionDays int) error {
-	if retentionDays <= 0 {
-		return nil
-	}
-	if retentionDays > 365 {
-		// Prevent misconfig causing huge deletion queries to run forever.
-		retentionDays = 365
-	}
-	cutoff := nowUnix - int64(retentionDays)*86400
-	_, err := tx.ExecContext(ctx, `DELETE FROM claim_log WHERE ts_unix < ?`, cutoff)
-	return err
-}
-
-func allocNextHost(ctx context.Context, tx *sql.Tx) (uint64, error) {
-	// Seed at a non-trivial offset so early addresses aren't ::1, ::2, etc.
-	const seed = uint64(0x1000)
-	row := tx.QueryRowContext(ctx, `SELECT next_host FROM alloc_state WHERE id = 1`)
-	var n sql.NullInt64
-	if err := row.Scan(&n); err != nil {
-		if err == sql.ErrNoRows {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO alloc_state (id, next_host) VALUES (1, ?)`, int64(seed)); err != nil {
-				return 0, err
-			}
-			return seed, nil
-		}
-		return 0, err
-	}
-	if !n.Valid || n.Int64 <= 0 {
-		return seed, nil
-	}
-	return uint64(n.Int64), nil
-}
-
-func bumpNextHost(ctx context.Context, tx *sql.Tx, next uint64) error {
-	_, err := tx.ExecContext(ctx, `UPDATE alloc_state SET next_host = ? WHERE id = 1`, int64(next))
-	return err
-}
-
-func ipv6FromHost(prefix *net.IPNet, host uint64) (net.IP, error) {
-	base := prefix.IP.To16()
-	if base == nil {
-		return nil, fmt.Errorf("invalid base ip")
-	}
-	ip := make(net.IP, 16)
-	copy(ip, base)
-	// For a /64, the host ID occupies the low 64 bits.
-	binary.BigEndian.PutUint64(ip[8:], host)
-	return ip, nil
-}
-
-func subtleComparePub(a, b ssh.PublicKey) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	am := a.Marshal()
-	bm := b.Marshal()
-	if len(am) != len(bm) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(am); i++ {
-		v |= am[i] ^ bm[i]
-	}
-	return v == 0
-}
-
-func (s *Store) GetByUsername(ctx context.Context, username string) (*Identity, error) {
-	canon, err := CanonicalUsername(username)
-	if err != nil {
-		return nil, nil
-	}
-	row := s.db.QueryRowContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
-FROM identities WHERE username = ?
-`, canon)
-	var (
-		u, pkText, fp, ipStr, created, last sql.NullString
-		allowTier2           sql.NullInt64
-	)
-	if err := row.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pkText.String))
-	if err != nil {
-		return nil, err
-	}
-	ip := net.ParseIP(ipStr.String)
-	if ip == nil {
-		return nil, fmt.Errorf("invalid ipv6 in db")
-	}
-	ct, err := time.Parse(time.RFC3339Nano, created.String)
-	if err != nil {
-		return nil, err
-	}
-	var lt *time.Time
-	if last.Valid && last.String != "" {
-		tm, err := time.Parse(time.RFC3339Nano, last.String)
-		if err == nil {
-			lt = &tm
-		}
-	}
-	return &Identity{
-		Username:    u.String,
-		PubKey:      pub,
-		PubKeyText:  pkText.String,
-		Fingerprint: fp.String,
-		IPv6:        ip,
-		AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
-		CreatedAt:   ct,
-		LastSeen:    lt,
-	}, nil
-}
-
-func (s *Store) DeleteByUsername(ctx context.Context, username string) error {
-	u, err := CanonicalUsername(username)
-	if err != nil {
-		return nil
-	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM identities WHERE username = ?`, u)
-	return err
-}
-
-func (s *Store) All(ctx context.Context) ([]Identity, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at, last_seen
-FROM identities
-`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []Identity
-	for rows.Next() {
-		var (
-			u, pkText, fp, ipStr, created, last sql.NullString
-			allowTier2           sql.NullInt64
-		)
-		if err := rows.Scan(&u, &pkText, &fp, &ipStr, &allowTier2, &created, &last); err != nil {
-			return nil, err
-		}
-		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pkText.String))
-		if err != nil {
-			return nil, err
-		}
-		ip := net.ParseIP(ipStr.String)
-		if ip == nil {
-			return nil, fmt.Errorf("invalid ipv6 in db")
-		}
-		ct, err := time.Parse(time.RFC3339Nano, created.String)
-		if err != nil {
-			return nil, err
-		}
-		var lt *time.Time
-		if last.Valid && last.String != "" {
-			tm, err := time.Parse(time.RFC3339Nano, last.String)
-			if err == nil {
-				lt = &tm
-			}
-		}
-		out = append(out, Identity{
-			Username:    u.String,
-			PubKey:      pub,
-			PubKeyText:  pkText.String,
-			Fingerprint: fp.String,
-			IPv6:        ip,
-			AllowTier2:  allowTier2.Valid && allowTier2.Int64 != 0,
-			CreatedAt:   ct,
-			LastSeen:    lt,
-		})
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) TouchLastSeen(ctx context.Context, username string) {
-	u, err := CanonicalUsername(username)
-	if err != nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, _ = s.db.ExecContext(ctx, `UPDATE identities SET last_seen=? WHERE username=?`, now, u)
-}
-
-func (s *Store) SetAllowTier2(ctx context.Context, username string, allow bool) error {
-	u, err := CanonicalUsername(username)
-	if err != nil {
-		return err
-	}
-	v := 0
-	if allow {
-		v = 1
-	}
-	_, err = s.db.ExecContext(ctx, `UPDATE identities SET allow_tier2=? WHERE username=?`, v, u)
-	return err
-}
-
-// ---- Invite-only claim (v1) -------------------------------------------------
+const (
+	StatusActive      AccountStatus = "active"
+	StatusSuspended   AccountStatus = "suspended"
+	StatusSoftDeleted AccountStatus = "soft_deleted"
+)
 
 type InviteLevel int
 
 const (
-	InviteLevelRoot InviteLevel = 0
-	InviteLevelA    InviteLevel = 1
-	InviteLevelB    InviteLevel = 2
-	InviteLevelC    InviteLevel = 3
+	InviteRoot InviteLevel = 0
+	InviteA    InviteLevel = 1
+	InviteB    InviteLevel = 2
+	InviteC    InviteLevel = 3
 )
 
 func (l InviteLevel) childCount() int {
 	switch l {
-	case InviteLevelRoot:
+	case InviteRoot:
 		return 3
-	case InviteLevelA:
+	case InviteA:
 		return 2
-	case InviteLevelB:
+	case InviteB:
 		return 1
 	default:
 		return 0
 	}
 }
 
-type Invite struct {
-	CodeHash   string
-	ParentHash *string
-	Level      InviteLevel
-	CreatedAt  time.Time
-	RedeemedBy *string
-	RedeemedAt *time.Time
+type ClaimLimits struct {
+	PerSourcePerHour int
+	PerSourcePerDay  int
+	GlobalPerHour    int
+	GlobalPerDay     int
+	RetentionDays    int
 }
 
-var (
-	ErrInviteInvalid  = errors.New("invite invalid")
-	ErrInviteRedeemed = errors.New("invite already redeemed")
+type Account struct {
+	Username  string        `json:"username"`
+	PubKey    string        `json:"pubkey"`
+	Status    AccountStatus `json:"status"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+	DeletedAt *time.Time    `json:"deleted_at,omitempty"`
+}
+
+type SpoolMessage struct {
+	ID         int64     `json:"id"`
+	Username   string    `json:"username"`
+	Alias      string    `json:"alias"`
+	Sender     string    `json:"sender"`
+	Ciphertext string    `json:"ciphertext"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type InviteRequestStatus string
+
+const (
+	InviteRequestPending      InviteRequestStatus = "pending"
+	InviteRequestAcknowledged InviteRequestStatus = "acknowledged"
 )
 
-// MintRootInvites creates N new root-level invite codes and returns plaintext codes.
-// The plaintext codes are not stored; only their hash is persisted.
-func (s *Store) MintRootInvites(ctx context.Context, n int, pepper string) ([]string, error) {
+type InviteRequest struct {
+	ID           int64               `json:"id"`
+	Email        string              `json:"email"`
+	Note         string              `json:"note,omitempty"`
+	SourceBucket string              `json:"source_bucket"`
+	Status       InviteRequestStatus `json:"status"`
+	CreatedAt    time.Time           `json:"created_at"`
+	UpdatedAt    time.Time           `json:"updated_at"`
+}
+
+type Store struct {
+	db                 *sql.DB
+	pepper             string
+	maxCiphertextBytes int
+	apiKeyRetention    time.Duration
+}
+
+func Open(path, pepper string) (*Store, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{
+		db:                 db,
+		pepper:             strings.TrimSpace(pepper),
+		maxCiphertextBytes: 256 * 1024,
+		apiKeyRetention:    30 * 24 * time.Hour,
+	}
+	if err := s.init(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) init() error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);`); err != nil {
+		return err
+	}
+	v, err := s.currentSchemaVersion()
+	if err != nil {
+		return err
+	}
+	for _, m := range migrations {
+		if m.version <= v {
+			continue
+		}
+		if err := s.applyMigration(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type migration struct {
+	version int
+	stmts   []string
+}
+
+var migrations = []migration{
+	{
+		version: 1,
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS accounts (
+			username TEXT PRIMARY KEY,
+			pubkey TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			deleted_at TEXT
+		);`,
+			`CREATE TABLE IF NOT EXISTS invites (
+			code_hash TEXT PRIMARY KEY,
+			parent_hash TEXT,
+			level INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			redeemed_by TEXT,
+			redeemed_at TEXT
+		);`,
+			`CREATE TABLE IF NOT EXISTS claim_log (
+			ts_unix INTEGER NOT NULL,
+			source_bucket TEXT NOT NULL
+		);`,
+			`CREATE INDEX IF NOT EXISTS idx_claim_log_ts ON claim_log(ts_unix);`,
+			`CREATE INDEX IF NOT EXISTS idx_claim_log_bucket_ts ON claim_log(source_bucket, ts_unix);`,
+			`CREATE TABLE IF NOT EXISTS spool_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL,
+			alias TEXT NOT NULL,
+			sender TEXT NOT NULL,
+			ciphertext TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		);`,
+			`CREATE INDEX IF NOT EXISTS idx_spool_user_exp ON spool_messages(username, expires_at);`,
+			`CREATE TABLE IF NOT EXISTS api_keys (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL,
+			revoked_at TEXT,
+			last_used_at TEXT
+		);`,
+			`CREATE INDEX IF NOT EXISTS idx_api_keys_user_rev ON api_keys(username, revoked_at);`,
+			`CREATE TABLE IF NOT EXISTS invite_requests (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			email TEXT NOT NULL,
+			note TEXT NOT NULL,
+			source_bucket TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+			`CREATE INDEX IF NOT EXISTS idx_invite_requests_status_created ON invite_requests(status, created_at);`,
+		},
+	},
+}
+
+func (s *Store) currentSchemaVersion() (int, error) {
+	var v sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&v); err != nil {
+		return 0, err
+	}
+	if !v.Valid {
+		return 0, nil
+	}
+	return int(v.Int64), nil
+}
+
+func (s *Store) applyMigration(m migration) error {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, st := range m.stmts {
+		if _, err := tx.Exec(st); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, m.version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SetMaxCiphertextBytes(n int) {
+	if n > 0 {
+		s.maxCiphertextBytes = n
+	}
+}
+
+func (s *Store) SetAPIKeyRetention(d time.Duration) {
+	if d > 0 {
+		s.apiKeyRetention = d
+	}
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
+func (s *Store) PurgeRevokedAPIKeys(ctx context.Context, now time.Time) error {
+	if s.apiKeyRetention <= 0 {
+		return nil
+	}
+	cut := now.UTC().Add(-s.apiKeyRetention).Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE revoked_at IS NOT NULL AND revoked_at != '' AND revoked_at <= ?`, cut)
+	return err
+}
+
+func (s *Store) EnqueueCiphertext(ctx context.Context, username, alias, sender, ciphertext string, ttl time.Duration) (*SpoolMessage, error) {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return nil, err
+	}
+	alias = strings.TrimSpace(alias)
+	sender = strings.TrimSpace(sender)
+	ciphertext = strings.TrimSpace(ciphertext)
+	if alias == "" || sender == "" || ciphertext == "" {
+		return nil, fmt.Errorf("missing alias/sender/ciphertext")
+	}
+	if s.maxCiphertextBytes > 0 && len(ciphertext) > s.maxCiphertextBytes {
+		return nil, fmt.Errorf("ciphertext too large")
+	}
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	acc, err := s.GetAccount(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	if acc.Status != StatusActive {
+		return nil, fmt.Errorf("account not active")
+	}
+	now := time.Now().UTC()
+	expires := now.Add(ttl)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO spool_messages(username, alias, sender, ciphertext, created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		u, alias, sender, ciphertext, now.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &SpoolMessage{
+		ID:         id,
+		Username:   u,
+		Alias:      alias,
+		Sender:     sender,
+		Ciphertext: ciphertext,
+		CreatedAt:  now,
+		ExpiresAt:  expires,
+	}, nil
+}
+
+func (s *Store) ListCiphertext(ctx context.Context, username string, now time.Time, limit int) ([]SpoolMessage, error) {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, username, alias, sender, ciphertext, created_at, expires_at
+		FROM spool_messages WHERE username=? AND expires_at>? ORDER BY id ASC LIMIT ?`, u, now.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]SpoolMessage, 0, limit)
+	for rows.Next() {
+		var (
+			m                SpoolMessage
+			created, expires string
+		)
+		if err := rows.Scan(&m.ID, &m.Username, &m.Alias, &m.Sender, &m.Ciphertext, &created, &expires); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		m.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteMessage(ctx context.Context, username string, id int64) error {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM spool_messages WHERE username=? AND id=?`, u, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) PurgeExpired(ctx context.Context, now time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM spool_messages WHERE expires_at<=?`, now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func CanonicalUsername(in string) (string, error) {
+	u := strings.ToLower(strings.TrimSpace(in))
+	if !usernameRE.MatchString(u) {
+		return "", fmt.Errorf("invalid username")
+	}
+	return u, nil
+}
+
+func (s *Store) MintRootInvites(ctx context.Context, n int) ([]string, error) {
 	if n <= 0 || n > 10000 {
 		return nil, fmt.Errorf("invalid invite count")
 	}
-	now := time.Now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	out := make([]string, 0, n)
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	out := make([]string, 0, n)
 	for len(out) < n {
-		code, err := randomInviteCode()
+		code, err := randomCode()
 		if err != nil {
 			return nil, err
 		}
-		h := inviteHash(code, pepper)
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO invites (code_hash, parent_hash, level, created_at)
-VALUES (?, NULL, ?, ?)
-`, h, int(InviteLevelRoot), nowText)
+		h := s.inviteHash(code)
+		_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash, parent_hash, level, created_at) VALUES(?, NULL, ?, ?)`, h, int(InviteRoot), now)
 		if err != nil {
-			// Collision is astronomically unlikely; if it happens, retry.
-			if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+			if isConstraint(err) {
 				continue
 			}
 			return nil, err
@@ -632,103 +404,13 @@ VALUES (?, NULL, ?, ?)
 	return out, nil
 }
 
-// RedeemInvite atomically marks an invite as redeemed_by. It returns newly created child invite codes.
-// Child codes are returned in plaintext once; only hashes are stored.
-func (s *Store) RedeemInvite(ctx context.Context, inviteCode string, redeemByUsername string, pepper string) ([]string, error) {
-	code := strings.TrimSpace(inviteCode)
-	if code == "" {
-		return nil, ErrInviteInvalid
-	}
-	redeemBy, err := CanonicalUsername(redeemByUsername)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	h := inviteHash(code, pepper)
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	row := tx.QueryRowContext(ctx, `
-SELECT level, redeemed_by, parent_hash
-FROM invites
-WHERE code_hash = ?
-`, h)
-	var (
-		levelInt               int
-		redeemedByDB, parentDB sql.NullString
-	)
-	if err := row.Scan(&levelInt, &redeemedByDB, &parentDB); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrInviteInvalid
-		}
-		return nil, err
-	}
-	if redeemedByDB.Valid && strings.TrimSpace(redeemedByDB.String) != "" {
-		return nil, ErrInviteRedeemed
-	}
-	lvl := InviteLevel(levelInt)
-	if lvl < InviteLevelRoot || lvl > InviteLevelC {
-		return nil, ErrInviteInvalid
-	}
-
-	_, err = tx.ExecContext(ctx, `
-UPDATE invites
-SET redeemed_by = ?, redeemed_at = ?
-WHERE code_hash = ? AND (redeemed_by IS NULL OR redeemed_by = '')
-`, redeemBy, nowText, h)
-	if err != nil {
-		return nil, err
-	}
-
-	childN := lvl.childCount()
-	children := make([]string, 0, childN)
-	for len(children) < childN {
-		cc, err := randomInviteCode()
-		if err != nil {
-			return nil, err
-		}
-		ch := inviteHash(cc, pepper)
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO invites (code_hash, parent_hash, level, created_at)
-VALUES (?, ?, ?, ?)
-`, ch, h, int(lvl+1), nowText)
-		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
-				continue
-			}
-			return nil, err
-		}
-		children = append(children, cc)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return children, nil
-}
-
-// ClaimWithInvite is the production onboarding path: invite-only first-claim with IPv6 allocation.
-// It atomically (1) validates + redeems the invite, (2) enforces claim limits, (3) allocates IPv6,
-// (4) writes the identity, and (5) mints child invites for the new user.
-func (s *Store) ClaimWithInvite(ctx context.Context, username string, pubKey ssh.PublicKey, ipv6Prefix *net.IPNet, sourceBucket string, limits ClaimLimits, inviteCode string, pepper string) (*Identity, []string, error) {
+func (s *Store) ClaimWithInvite(ctx context.Context, username, pubkey, inviteCode, sourceBucket string, limits ClaimLimits) (*Account, []string, error) {
 	u, err := CanonicalUsername(username)
 	if err != nil {
 		return nil, nil, err
 	}
-	if pubKey == nil {
+	if strings.TrimSpace(pubkey) == "" {
 		return nil, nil, fmt.Errorf("missing pubkey")
-	}
-	if ipv6Prefix == nil || ipv6Prefix.IP == nil || ipv6Prefix.IP.To16() == nil {
-		return nil, nil, fmt.Errorf("invalid ipv6 prefix")
-	}
-	ones, bits := ipv6Prefix.Mask.Size()
-	if bits != 128 || ones != 64 {
-		return nil, nil, fmt.Errorf("ipv6 prefix must be /64")
 	}
 	code := strings.TrimSpace(inviteCode)
 	if code == "" {
@@ -739,12 +421,10 @@ func (s *Store) ClaimWithInvite(ctx context.Context, username string, pubKey ssh
 		sourceBucket = "unknown"
 	}
 
-	pubKeyText := string(ssh.MarshalAuthorizedKey(pubKey))
-	fp := FingerprintSHA256(pubKey)
 	now := time.Now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
 	nowUnix := now.Unix()
-	invHash := inviteHash(code, pepper)
+	h := s.inviteHash(code)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -752,133 +432,433 @@ func (s *Store) ClaimWithInvite(ctx context.Context, username string, pubKey ssh
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Username must be unclaimed.
-	existing, err := getByUsernameTx(ctx, tx, u)
-	if err != nil {
-		return nil, nil, err
-	}
-	if existing != nil {
-		return nil, nil, fmt.Errorf("username already claimed")
-	}
-	// Enforce rate limits for new claims (invite-only still benefits from throttling).
+	// no squatting via open claim; invite required and rate-limited.
 	if err := enforceClaimLimits(ctx, tx, sourceBucket, nowUnix, limits); err != nil {
 		return nil, nil, err
 	}
 
-	// Validate invite and lock it by updating redeemed_by conditionally.
-	row := tx.QueryRowContext(ctx, `
-SELECT level, redeemed_by
-FROM invites
-WHERE code_hash = ?
-`, invHash)
-	var levelInt int
-	var redeemedByDB sql.NullString
-	if err := row.Scan(&levelInt, &redeemedByDB); err != nil {
+	// username uniqueness.
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE username=?`, u).Scan(&existing); err != nil {
+		return nil, nil, err
+	}
+	if existing > 0 {
+		return nil, nil, ErrUsernameTaken
+	}
+
+	var (
+		level      int
+		redeemedBy sql.NullString
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT level, redeemed_by FROM invites WHERE code_hash=?`, h).Scan(&level, &redeemedBy); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil, ErrInviteInvalid
 		}
 		return nil, nil, err
 	}
-	if redeemedByDB.Valid && strings.TrimSpace(redeemedByDB.String) != "" {
+	if redeemedBy.Valid && strings.TrimSpace(redeemedBy.String) != "" {
 		return nil, nil, ErrInviteRedeemed
 	}
-	lvl := InviteLevel(levelInt)
-	if lvl < InviteLevelRoot || lvl > InviteLevelC {
-		return nil, nil, ErrInviteInvalid
-	}
-	_, err = tx.ExecContext(ctx, `
-UPDATE invites
-SET redeemed_by = ?, redeemed_at = ?
-WHERE code_hash = ? AND (redeemed_by IS NULL OR redeemed_by = '')
-`, u, nowText, invHash)
+
+	res, err := tx.ExecContext(ctx, `UPDATE invites SET redeemed_by=?, redeemed_at=? WHERE code_hash=? AND (redeemed_by IS NULL OR redeemed_by='')`, u, nowText, h)
 	if err != nil {
 		return nil, nil, err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return nil, nil, ErrInviteRedeemed
 	}
 
-	// Allocate IPv6 and insert identity.
-	nextHost, err := allocNextHost(ctx, tx)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO accounts(username, pubkey, status, created_at, updated_at, deleted_at) VALUES(?, ?, ?, ?, ?, NULL)`, u, strings.TrimSpace(pubkey), string(StatusActive), nowText, nowText); err != nil {
+		if isConstraint(err) {
+			return nil, nil, ErrUsernameTaken
+		}
 		return nil, nil, err
 	}
-	allocated, err := ipv6FromHost(ipv6Prefix, nextHost)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := bumpNextHost(ctx, tx, nextHost+1); err != nil {
-		return nil, nil, err
-	}
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO identities (username, pubkey, fingerprint, ipv6_addr, allow_tier2, created_at)
-VALUES (?, ?, ?, ?, 0, ?)
-`, u, pubKeyText, fp, allocated.String(), nowText)
-	if err != nil {
-		return nil, nil, err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO claim_log (ts_unix, source_bucket) VALUES (?, ?)`, nowUnix, sourceBucket)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO claim_log(ts_unix, source_bucket) VALUES(?, ?)`, nowUnix, sourceBucket); err != nil {
 		return nil, nil, err
 	}
 	if err := pruneClaimLog(ctx, tx, nowUnix, limits.RetentionDays); err != nil {
 		return nil, nil, err
 	}
 
-	// Mint child invites for the new account.
+	lvl := InviteLevel(level)
 	childN := lvl.childCount()
 	children := make([]string, 0, childN)
 	for len(children) < childN {
-		cc, err := randomInviteCode()
+		c, err := randomCode()
 		if err != nil {
 			return nil, nil, err
 		}
-		ch := inviteHash(cc, pepper)
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO invites (code_hash, parent_hash, level, created_at)
-VALUES (?, ?, ?, ?)
-`, ch, invHash, int(lvl+1), nowText)
+		ch := s.inviteHash(c)
+		_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash, parent_hash, level, created_at) VALUES(?, ?, ?, ?)`, ch, h, level+1, nowText)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+			if isConstraint(err) {
 				continue
 			}
 			return nil, nil, err
 		}
-		children = append(children, cc)
+		children = append(children, c)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
-	return &Identity{
-		Username:    u,
-		PubKey:      pubKey,
-		PubKeyText:  pubKeyText,
-		Fingerprint: fp,
-		IPv6:        allocated,
-		CreatedAt:   now,
-		LastSeen:    nil,
-	}, children, nil
+	acc := &Account{Username: u, PubKey: strings.TrimSpace(pubkey), Status: StatusActive, CreatedAt: now, UpdatedAt: now}
+	return acc, children, nil
 }
 
-func randomInviteCode() (string, error) {
-	// 20 chars base32 without padding from 12 random bytes.
+func (s *Store) SoftDelete(ctx context.Context, username string) error {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET status=?, updated_at=?, deleted_at=? WHERE username=?`, string(StatusSoftDeleted), now, now, u)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) Restore(ctx context.Context, username string) error {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET status=?, updated_at=?, deleted_at=NULL WHERE username=?`, string(StatusActive), now, u)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetAccount(ctx context.Context, username string) (*Account, error) {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		a                    Account
+		createdAt, updatedAt string
+		deletedAt            sql.NullString
+	)
+	err = s.db.QueryRowContext(ctx, `SELECT username, pubkey, status, created_at, updated_at, deleted_at FROM accounts WHERE username=?`, u).
+		Scan(&a.Username, &a.PubKey, &a.Status, &createdAt, &updatedAt, &deletedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	a.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	if deletedAt.Valid && strings.TrimSpace(deletedAt.String) != "" {
+		t, _ := time.Parse(time.RFC3339Nano, deletedAt.String)
+		a.DeletedAt = &t
+	}
+	return &a, nil
+}
+
+func (s *Store) CreateInviteRequest(ctx context.Context, email, note, sourceBucket string) (*InviteRequest, error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+	note = strings.TrimSpace(note)
+	sourceBucket = strings.TrimSpace(sourceBucket)
+	if email == "" || !strings.Contains(email, "@") || len(email) > 254 {
+		return nil, fmt.Errorf("invalid email")
+	}
+	if sourceBucket == "" {
+		sourceBucket = "unknown"
+	}
+	if len(note) > 1000 {
+		note = note[:1000]
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO invite_requests(email, note, source_bucket, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		email, note, sourceBucket, string(InviteRequestPending), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &InviteRequest{
+		ID:           id,
+		Email:        email,
+		Note:         note,
+		SourceBucket: sourceBucket,
+		Status:       InviteRequestPending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}, nil
+}
+
+func (s *Store) ListInviteRequests(ctx context.Context, status string, limit int) ([]InviteRequest, error) {
+	status = strings.TrimSpace(strings.ToLower(status))
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if status == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, email, note, source_bucket, status, created_at, updated_at FROM invite_requests ORDER BY id DESC LIMIT ?`, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, email, note, source_bucket, status, created_at, updated_at FROM invite_requests WHERE status=? ORDER BY id DESC LIMIT ?`, status, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]InviteRequest, 0, limit)
+	for rows.Next() {
+		var (
+			r               InviteRequest
+			created, update string
+		)
+		if err := rows.Scan(&r.ID, &r.Email, &r.Note, &r.SourceBucket, &r.Status, &created, &update); err != nil {
+			return nil, err
+		}
+		r.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, update)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AcknowledgeInviteRequest(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("invalid id")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `UPDATE invite_requests SET status=?, updated_at=? WHERE id=?`,
+		string(InviteRequestAcknowledged), now, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) IssueAPIKey(ctx context.Context, username string) (string, error) {
+	u, err := CanonicalUsername(username)
+	if err != nil {
+		return "", err
+	}
+	acc, err := s.GetAccount(ctx, u)
+	if err != nil {
+		return "", err
+	}
+	if acc.Status != StatusActive {
+		return "", fmt.Errorf("account not active")
+	}
+	key, err := randomAPIKey()
+	if err != nil {
+		return "", err
+	}
+	h := s.keyHash(key)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at=? WHERE username=? AND (revoked_at IS NULL OR revoked_at='')`, now, u); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO api_keys(username, key_hash, created_at, revoked_at, last_used_at) VALUES(?, ?, ?, NULL, NULL)`, u, h, now); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+func (s *Store) AuthenticateAPIKey(ctx context.Context, presented string) (string, error) {
+	key := strings.TrimSpace(presented)
+	if key == "" {
+		return "", ErrUnauthorized
+	}
+	h := s.keyHash(key)
+	var username string
+	err := s.db.QueryRowContext(ctx, `SELECT username FROM api_keys WHERE key_hash=? AND (revoked_at IS NULL OR revoked_at='')`, h).Scan(&username)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", ErrUnauthorized
+		}
+		return "", err
+	}
+	acc, err := s.GetAccount(ctx, username)
+	if err != nil {
+		if err == ErrNotFound {
+			return "", ErrUnauthorized
+		}
+		return "", err
+	}
+	if acc.Status != StatusActive {
+		return "", ErrUnauthorized
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, _ = s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at=? WHERE key_hash=?`, now, h)
+	return username, nil
+}
+
+func (s *Store) RotateAPIKey(ctx context.Context, presented string) (string, string, error) {
+	key := strings.TrimSpace(presented)
+	if key == "" {
+		return "", "", ErrUnauthorized
+	}
+	oldHash := s.keyHash(key)
+	newKey, err := randomAPIKey()
+	if err != nil {
+		return "", "", err
+	}
+	newHash := s.keyHash(newKey)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var username string
+	if err := tx.QueryRowContext(ctx, `SELECT username FROM api_keys WHERE key_hash=? AND (revoked_at IS NULL OR revoked_at='')`, oldHash).Scan(&username); err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", ErrUnauthorized
+		}
+		return "", "", err
+	}
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM accounts WHERE username=?`, username).Scan(&status); err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", ErrUnauthorized
+		}
+		return "", "", err
+	}
+	if AccountStatus(status) != StatusActive {
+		return "", "", ErrUnauthorized
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at=? WHERE key_hash=? AND (revoked_at IS NULL OR revoked_at='')`, now, oldHash)
+	if err != nil {
+		return "", "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return "", "", ErrUnauthorized
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO api_keys(username, key_hash, created_at, revoked_at, last_used_at) VALUES(?, ?, ?, NULL, NULL)`, username, newHash, now); err != nil {
+		return "", "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", err
+	}
+	return username, newKey, nil
+}
+
+func (s *Store) inviteHash(code string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(s.pepper) + ":" + strings.TrimSpace(code)))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func (s *Store) keyHash(key string) string {
+	sum := sha256.Sum256([]byte("api:" + strings.TrimSpace(s.pepper) + ":" + strings.TrimSpace(key)))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func enforceClaimLimits(ctx context.Context, tx *sql.Tx, source string, nowUnix int64, l ClaimLimits) error {
+	if l.PerSourcePerHour > 0 {
+		if n, err := countClaims(ctx, tx, source, nowUnix-3600); err != nil {
+			return err
+		} else if n >= l.PerSourcePerHour {
+			return ErrClaimRateLimited
+		}
+	}
+	if l.PerSourcePerDay > 0 {
+		if n, err := countClaims(ctx, tx, source, nowUnix-86400); err != nil {
+			return err
+		} else if n >= l.PerSourcePerDay {
+			return ErrClaimRateLimited
+		}
+	}
+	if l.GlobalPerHour > 0 {
+		if n, err := countClaimsGlobal(ctx, tx, nowUnix-3600); err != nil {
+			return err
+		} else if n >= l.GlobalPerHour {
+			return ErrClaimRateLimited
+		}
+	}
+	if l.GlobalPerDay > 0 {
+		if n, err := countClaimsGlobal(ctx, tx, nowUnix-86400); err != nil {
+			return err
+		} else if n >= l.GlobalPerDay {
+			return ErrClaimRateLimited
+		}
+	}
+	return nil
+}
+
+func countClaims(ctx context.Context, tx *sql.Tx, source string, since int64) (int, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM claim_log WHERE source_bucket=? AND ts_unix>=?`, source, since).Scan(&n)
+	return n, err
+}
+
+func countClaimsGlobal(ctx context.Context, tx *sql.Tx, since int64) (int, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM claim_log WHERE ts_unix>=?`, since).Scan(&n)
+	return n, err
+}
+
+func pruneClaimLog(ctx context.Context, tx *sql.Tx, nowUnix int64, days int) error {
+	if days <= 0 {
+		return nil
+	}
+	cut := nowUnix - int64(days*86400)
+	_, err := tx.ExecContext(ctx, `DELETE FROM claim_log WHERE ts_unix<?`, cut)
+	return err
+}
+
+func randomCode() (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	enc := base64.StdEncoding.EncodeToString(b[:])
-	enc = strings.TrimRight(enc, "=")
-	enc = strings.NewReplacer("+", "A", "/", "B").Replace(enc)
+	enc := base64.RawURLEncoding.EncodeToString(b[:])
 	enc = strings.ToUpper(enc)
-	// Make it shorter/printable.
 	if len(enc) > 20 {
 		enc = enc[:20]
 	}
 	return enc, nil
 }
 
-func inviteHash(code string, pepper string) string {
-	// Pepper is optional (dev). For production, set SISUMAIL_INVITE_PEPPER.
-	msg := strings.TrimSpace(code)
-	pep := strings.TrimSpace(pepper)
-	sum := sha256.Sum256([]byte(pep + ":" + msg))
-	return base64.StdEncoding.EncodeToString(sum[:])
+func randomAPIKey() (string, error) {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "smk_" + base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func isConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique") || strings.Contains(msg, "constraint")
 }

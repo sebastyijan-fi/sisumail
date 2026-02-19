@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Claim Account - Sisumail</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main class="container narrow">
+    <p class="kicker"><a href="/">sisumail.fi</a></p>
+    <h1>Claim account with invite code</h1>
+    <p class="lead">Enter your invite code, pick your handle, and submit your public key to complete claim.</p>
+
+    <form id="invite-form" class="card">
+      <label for="invite_code">Invite code</label>
+      <input id="invite_code" name="invite_code" type="text" required autocomplete="off" placeholder="Paste invite code">
+
+      <label for="username">What handle?</label>
+      <input id="username" name="username" type="text" required autocomplete="off" placeholder="yourhandle">
+
+      <label for="pubkey">Public key</label>
+      <textarea id="pubkey" name="pubkey" rows="5" required maxlength="5000" placeholder="age1..."></textarea>
+
+      <button class="btn primary" type="submit">Claim account</button>
+    </form>
+
+    <section id="result" class="card hidden" aria-live="polite"></section>
+  </main>
+
+  <script>
+    const form = document.getElementById("invite-form");
+    const result = document.getElementById("result");
+    const esc = (s) => String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      result.classList.add("hidden");
+      const invite_code = document.getElementById("invite_code").value.trim();
+      const username = document.getElementById("username").value.trim();
+      const pubkey = document.getElementById("pubkey").value.trim();
+
+      try {
+        const res = await fetch("/v1/claim", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({invite_code, username, pubkey})
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error?.message || "Request failed");
+        }
+        result.innerHTML = "<h2>Claim complete</h2>" +
+          "<p><strong>Username:</strong> " + esc(data.username) + "</p>" +
+          "<p><strong>Status:</strong> " + esc(data.status) + "</p>" +
+          "<p><strong>API key (shown once):</strong><br><code>" + esc(data.api_key) + "</code></p>" +
+          "<p><strong>Child invites:</strong> " + (Array.isArray(data.child_invites) ? data.child_invites.length : 0) + "</p>";
+        result.classList.remove("hidden");
+      } catch (err) {
+        result.innerHTML = "<h2>Failed</h2><p>" + esc(err.message || err) + "</p>";
+        result.classList.remove("hidden");
+      }
+    });
+
+    const params = new URLSearchParams(window.location.search);
+    const inviteFromQuery = params.get("invite_code");
+    if (inviteFromQuery) {
+      document.getElementById("invite_code").value = inviteFromQuery;
+      document.getElementById("username").focus();
+    }
+  </script>
+</body>
+</html>

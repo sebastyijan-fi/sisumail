@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sisumail</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main class="container">
+    <p class="kicker">sisumail.fi</p>
+    <h1>Email identity infrastructure.</h1>
+    <p class="lead">Enter your invite code to start account claim. You will continue into handle + key setup right away.</p>
+
+    <form class="card" action="/apply" method="get">
+      <label for="invite_code">Invite code</label>
+      <input id="invite_code" name="invite_code" type="text" required autocomplete="off" placeholder="Paste invite code">
+      <div class="actions">
+        <button class="btn primary" type="submit">Continue</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>
