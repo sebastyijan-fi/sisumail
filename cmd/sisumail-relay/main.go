@@ -37,6 +37,10 @@ type appMetrics struct {
 	purgeRemovedTotal      atomic.Int64
 }
 
+type appConfig struct {
+	metricsToken string
+}
+
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -67,6 +71,7 @@ func main() {
 		pepper                = flag.String("invite-pepper", "", "invite hash pepper")
 		adminToken            = flag.String("admin-token", "", "admin bearer token(s), comma-separated")
 		adminAllowCIDRs       = flag.String("admin-allow-cidrs", "", "optional comma-separated CIDRs allowed for admin API access")
+		metricsToken          = flag.String("metrics-token", "", "optional bearer token required for /metrics")
 		purgeInterval         = flag.Duration("purge-interval", 30*time.Second, "expired spool purge interval (0 disables)")
 		siteDir               = flag.String("site-dir", "./web", "landing page directory")
 		maxJSONBytes          = flag.Int64("max-json-bytes", 1<<20, "maximum bytes accepted for JSON API bodies")
@@ -91,6 +96,9 @@ func main() {
 	if strings.TrimSpace(*adminAllowCIDRs) == "" {
 		*adminAllowCIDRs = strings.TrimSpace(os.Getenv("SISUMAIL_ADMIN_ALLOW_CIDRS"))
 	}
+	if strings.TrimSpace(*metricsToken) == "" {
+		*metricsToken = strings.TrimSpace(os.Getenv("SISUMAIL_METRICS_TOKEN"))
+	}
 	if strings.TrimSpace(*pepper) == "" {
 		log.Printf("WARNING: invite pepper is empty; invite/api key hashing is weakened")
 	}
@@ -111,6 +119,9 @@ func main() {
 		RetentionDays:    30,
 	}
 	metrics := &appMetrics{}
+	cfg := &appConfig{
+		metricsToken: strings.TrimSpace(*metricsToken),
+	}
 	adminTokens := parseAdminTokens(*adminToken)
 	adminCIDRs, err := parseCIDRs(*adminAllowCIDRs)
 	if err != nil {
@@ -125,11 +136,11 @@ func main() {
 	} else {
 		log.Printf("site dir %q not found; landing routes disabled", *siteDir)
 	}
-	registerOperationalRoutes(mux, store, metrics)
+	registerOperationalRoutes(mux, store, metrics, cfg)
 	registerCoreAPIRoutes(mux, store, metrics, limits, adminTokens, adminCIDRs, *maxJSONBytes)
 	registerRemainingAPIRoutes(mux, store, metrics, adminTokens, adminCIDRs, *maxJSONBytes)
 
-	h := withLogging(mux, metrics)
+	h := withRecover(withLogging(mux, metrics))
 	log.Printf("relay api listening on %s", *listen)
 	s := &http.Server{
 		Addr:              *listen,
@@ -171,6 +182,18 @@ func main() {
 	}
 }
 
+func withRecover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic recovered path=%q remote=%q panic=%v", r.URL.Path, r.RemoteAddr, rec)
+				writeErr(w, http.StatusInternalServerError, "internal_error", "internal error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 func withLogging(next http.Handler, metrics *appMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -186,6 +209,22 @@ func withLogging(next http.Handler, metrics *appMetrics) http.Handler {
 		log.Printf("request_id=%s method=%s path=%s status=%d bytes=%d remote=%q dur_ms=%d",
 			rid, r.Method, r.URL.Path, sw.status, sw.bytes, r.RemoteAddr, time.Since(start).Milliseconds())
 	})
+}
+
+func requireMetricsAuth(w http.ResponseWriter, r *http.Request, cfg *appConfig) bool {
+	if cfg == nil || strings.TrimSpace(cfg.metricsToken) == "" {
+		return true
+	}
+	presented, ok := bearerToken(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "metrics token required")
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(presented)), []byte(strings.TrimSpace(cfg.metricsToken))) != 1 {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "metrics token required")
+		return false
+	}
+	return true
 }
 
 func sourceBucket(remote string) string {
@@ -394,7 +433,7 @@ func parseInt64(s string) (int64, error) {
 	return out, nil
 }
 
-func registerOperationalRoutes(mux *http.ServeMux, store *identity.Store, metrics *appMetrics) {
+func registerOperationalRoutes(mux *http.ServeMux, store *identity.Store, metrics *appMetrics, cfg *appConfig) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
@@ -406,6 +445,9 @@ func registerOperationalRoutes(mux *http.ServeMux, store *identity.Store, metric
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !requireMetricsAuth(w, r, cfg) {
+			return
+		}
 		writeMetrics(w, metrics)
 	})
 }

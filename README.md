@@ -40,6 +40,7 @@ Secrets can be provided via environment variables instead of CLI flags:
 - `SISUMAIL_INVITE_PEPPER`
 - `SISUMAIL_ADMIN_TOKEN`
 - `SISUMAIL_ADMIN_ALLOW_CIDRS`
+- `SISUMAIL_METRICS_TOKEN` (optional; protects `/metrics`)
 
 Production systemd templates:
 

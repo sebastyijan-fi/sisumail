@@ -28,7 +28,7 @@ func TestOperationalRoutes_HealthReadyMetrics(t *testing.T) {
 	metrics.smtpAcceptedTotal.Add(3)
 
 	mux := http.NewServeMux()
-	registerOperationalRoutes(mux, s, metrics)
+	registerOperationalRoutes(mux, s, metrics, &appConfig{})
 	h := withLogging(mux, metrics)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -108,7 +108,7 @@ func TestRequireAdmin_TokenAndCIDR(t *testing.T) {
 func TestReadyzFailsWhenStoreClosed(t *testing.T) {
 	s := openHTTPTestStore(t)
 	mux := http.NewServeMux()
-	registerOperationalRoutes(mux, s, &appMetrics{})
+	registerOperationalRoutes(mux, s, &appMetrics{}, &appConfig{})
 	_ = s.Close()
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
@@ -116,5 +116,27 @@ func TestReadyzFailsWhenStoreClosed(t *testing.T) {
 	mux.ServeHTTP(res, req)
 	if res.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 after store close, got %d", res.Code)
+	}
+}
+
+func TestMetricsTokenProtection(t *testing.T) {
+	s := openHTTPTestStore(t)
+	defer s.Close()
+	mux := http.NewServeMux()
+	registerOperationalRoutes(mux, s, &appMetrics{}, &appConfig{metricsToken: "mtok"})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", res.Code)
+	}
+
+	okReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	okReq.Header.Set("Authorization", "Bearer mtok")
+	okRes := httptest.NewRecorder()
+	mux.ServeHTTP(okRes, okReq)
+	if okRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 with token, got %d", okRes.Code)
 	}
 }
