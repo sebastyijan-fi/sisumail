@@ -35,6 +35,17 @@ go run ./cmd/sisumail-relay \
   -smtp-per-ip-per-minute 120
 ```
 
+Secrets can be provided via environment variables instead of CLI flags:
+
+- `SISUMAIL_INVITE_PEPPER`
+- `SISUMAIL_ADMIN_TOKEN`
+- `SISUMAIL_ADMIN_ALLOW_CIDRS`
+
+Production systemd templates:
+
+- `deploy/systemd/sisumail-relay.service`
+- `deploy/systemd/sisumail-relay.env.example`
+
 ## API (Current)
 
 Public:

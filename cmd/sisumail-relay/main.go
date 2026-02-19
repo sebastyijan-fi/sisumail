@@ -82,6 +82,18 @@ func main() {
 		smtpMaxRcptPerSession = flag.Int("smtp-max-rcpt-per-session", 10, "maximum RCPT commands per SMTP session")
 	)
 	flag.Parse()
+	if strings.TrimSpace(*pepper) == "" {
+		*pepper = strings.TrimSpace(os.Getenv("SISUMAIL_INVITE_PEPPER"))
+	}
+	if strings.TrimSpace(*adminToken) == "" {
+		*adminToken = strings.TrimSpace(os.Getenv("SISUMAIL_ADMIN_TOKEN"))
+	}
+	if strings.TrimSpace(*adminAllowCIDRs) == "" {
+		*adminAllowCIDRs = strings.TrimSpace(os.Getenv("SISUMAIL_ADMIN_ALLOW_CIDRS"))
+	}
+	if strings.TrimSpace(*pepper) == "" {
+		log.Printf("WARNING: invite pepper is empty; invite/api key hashing is weakened")
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
