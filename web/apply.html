@@ -11,6 +11,7 @@
     <p class="kicker"><a href="/">sisumail.fi</a></p>
     <h1>Claim account with invite code</h1>
     <p class="lead">Enter your invite code, pick your handle, and submit your public key to complete claim.</p>
+    <p class="lead"><a href="/quickstart">Need help? Open user quickstart</a></p>
 
     <form id="invite-form" class="card">
       <label for="invite_code">Invite code</label>
@@ -50,12 +51,27 @@
         if (!res.ok) {
           throw new Error(data?.error?.message || "Request failed");
         }
+        const accountCurl = "curl -H 'Authorization: Bearer " + esc(data.api_key) + "' https://sisumail.fi/v1/me/account";
         result.innerHTML = "<h2>Claim complete</h2>" +
           "<p><strong>Username:</strong> " + esc(data.username) + "</p>" +
           "<p><strong>Status:</strong> " + esc(data.status) + "</p>" +
-          "<p><strong>API key (shown once):</strong><br><code>" + esc(data.api_key) + "</code></p>" +
-          "<p><strong>Child invites:</strong> " + (Array.isArray(data.child_invites) ? data.child_invites.length : 0) + "</p>";
+          "<p><strong>API key (shown once):</strong><br><code id='api-key'>" + esc(data.api_key) + "</code></p>" +
+          "<p><button class='btn' id='copy-key' type='button'>Copy API key</button></p>" +
+          "<p><strong>Child invites:</strong> " + (Array.isArray(data.child_invites) ? data.child_invites.length : 0) + "</p>" +
+          "<h3>Next step</h3>" +
+          "<p>Test your account API right now:</p>" +
+          "<pre><code>" + accountCurl + "</code></pre>" +
+          "<p>Then follow the <a href='/quickstart'>quickstart guide</a> for SMTP and message fetch flow.</p>";
         result.classList.remove("hidden");
+        const copyBtn = document.getElementById("copy-key");
+        copyBtn?.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(String(data.api_key || ""));
+            copyBtn.textContent = "Copied";
+          } catch (_) {
+            copyBtn.textContent = "Copy failed";
+          }
+        });
       } catch (err) {
         result.innerHTML = "<h2>Failed</h2><p>" + esc(err.message || err) + "</p>";
         result.classList.remove("hidden");

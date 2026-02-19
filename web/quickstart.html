@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>User Quickstart - Sisumail</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main class="container narrow">
+    <p class="kicker"><a href="/">sisumail.fi</a></p>
+    <h1>User quickstart</h1>
+    <p class="lead">This is the fastest path from invite code to receiving encrypted messages.</p>
+
+    <section class="card">
+      <h2>1. Claim account</h2>
+      <p>Open <a href="/apply">/apply</a>, submit your invite code, handle, and public key. Save your API key immediately.</p>
+    </section>
+
+    <section class="card">
+      <h2>2. Verify account access</h2>
+      <pre><code>curl -H "Authorization: Bearer &lt;API_KEY&gt;" \
+  https://sisumail.fi/v1/me/account</code></pre>
+    </section>
+
+    <section class="card">
+      <h2>3. Send encrypted payload (SMTP)</h2>
+      <p>Recipient formats:</p>
+      <p><code>&lt;username&gt;@sisumail.fi</code> or <code>&lt;service&gt;@&lt;username&gt;.sisumail.fi</code></p>
+      <p>Payload must be ciphertext-like (`ciphertext:`, `age1`, or `ENC:` prefix).</p>
+      <pre><code>printf 'ciphertext:hello\\n' | \
+  sendmail youruser@sisumail.fi</code></pre>
+    </section>
+
+    <section class="card">
+      <h2>4. Read queued messages</h2>
+      <pre><code>curl -H "Authorization: Bearer &lt;API_KEY&gt;" \
+  https://sisumail.fi/v1/me/messages</code></pre>
+    </section>
+
+    <section class="card">
+      <h2>5. Rotate key</h2>
+      <pre><code>curl -X POST -H "Authorization: Bearer &lt;API_KEY&gt;" \
+  https://sisumail.fi/v1/me/api-key/rotate</code></pre>
+      <p>Store the new key. The old key is immediately revoked.</p>
+    </section>
+  </main>
+</body>
+</html>
