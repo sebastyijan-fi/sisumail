@@ -1,0 +1,46 @@
+.DS_Store
+.env
+.env.local
+.env.*
+
+# Next.js
+.next/
+
+# Node
+node_modules/
+.npm/
+npm-debug.log*
+.pnpm-store/
+.vscode/
+.idea/
+
+# Go / Rust
+bin/
+target/
+*.test
+*.out
+
+dist/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.venv/
+venv/
+.venv311/
+.venv313/
+
+# Logs / temporary
+*.log
+logs/
+tmp/
+temp/
+
+# Build outputs
+dist/
+build/
+out/
+coverage/
